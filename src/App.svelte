@@ -425,6 +425,67 @@
     localStorage.setItem('edentext-zoom', String(zoom));
   }
 
+  // ===== 手机端增强：选中浮动格式条 + 浮动撤销/重做 + 双击缩放 + 光标跟随 =====
+  let mobileChromeDone = false;
+  $effect(() => {
+    if (mobileChromeDone || !editor || window.innerWidth >= 820) return;
+    mobileChromeDone = true;
+    const ed = editor;
+
+    // 选中文字时弹出的紧凑格式条
+    const bar = document.createElement('div');
+    bar.style.cssText = 'position:fixed;left:0;top:0;z-index:99999;display:none;align-items:center;background:#2b2b2e;color:#fff;border-radius:10px;padding:4px;box-shadow:0 4px 16px rgba(0,0,0,.45);';
+    const mkBtn = (label: string, run: () => void) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = 'border:none;background:transparent;color:#fff;font-size:16px;font-weight:600;min-width:34px;height:34px;border-radius:6px;';
+      b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); run(); };
+      bar.appendChild(b);
+    };
+    mkBtn('B', () => ed.chain().focus().toggleBold().run());
+    mkBtn('I', () => ed.chain().focus().toggleItalic().run());
+    mkBtn('U', () => ed.chain().focus().toggleUnderline().run());
+    mkBtn('S', () => ed.chain().focus().toggleStrike().run());
+    document.body.appendChild(bar);
+
+    const positionBar = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) { bar.style.display = 'none'; return; }
+      const r = sel.getRangeAt(0).getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) { bar.style.display = 'none'; return; }
+      bar.style.display = 'flex';
+      const bw = bar.offsetWidth || 160;
+      bar.style.left = Math.max(8, Math.min(r.left, window.innerWidth - bw - 8)) + 'px';
+      bar.style.top = (r.bottom + 8 + bar.offsetHeight < window.innerHeight ? r.bottom + 8 : r.top - bar.offsetHeight - 8) + 'px';
+    };
+    document.addEventListener('selectionchange', positionBar);
+
+    // 右下角浮动撤销 / 重做（拇指热区）
+    const fab = document.createElement('div');
+    fab.style.cssText = 'position:fixed;right:10px;bottom:56px;z-index:99999;display:flex;flex-direction:column;gap:8px;';
+    const mkFab = (label: string, run: () => void) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = 'width:44px;height:44px;border-radius:50%;border:none;background:#2f6fed;color:#fff;font-size:18px;box-shadow:0 3px 10px rgba(0,0,0,.4);';
+      b.onclick = (e) => { e.preventDefault(); run(); };
+      fab.appendChild(b);
+    };
+    mkFab('↶', () => ed.chain().focus().undo().run());
+    mkFab('↷', () => ed.chain().focus().redo().run());
+    document.body.appendChild(fab);
+
+    // 双击放大一档
+    document.addEventListener('dblclick', () => setZoom(clampZoom(zoom + 25)));
+
+    // 光标跟随：滚动到可视区中央，避免被键盘/工具栏遮挡
+    document.addEventListener('selectionchange', () => {
+      const sel = window.getSelection();
+      const node = sel?.anchorNode;
+      const el = node ? (node.nodeType === 3 ? node.parentElement : node as HTMLElement) : null;
+      el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    });
+  });
+
   function selectTheme(m: ThemeMode) {
     themeMode = m;
     saveTheme(m);
