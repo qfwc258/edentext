@@ -44,7 +44,7 @@ export type DocumentFormat = 'odt' | 'docx';
 const FORMAT_KEY = docKey('edentext-doc-format');
 
 export function loadDocFormat(): DocumentFormat {
-  return localStorage.getItem(FORMAT_KEY) === 'docx' ? 'docx' : 'odt';
+  return localStorage.getItem(FORMAT_KEY) === 'odt' ? 'odt' : 'docx';
 }
 
 export function saveDocFormat(format: DocumentFormat): void {

@@ -746,7 +746,7 @@
     docProps = { ...EMPTY_DOC_PROPERTIES };
     saveDocProperties(docProps);
     fileHandle = null;
-    documentFormat = 'odt';
+    documentFormat = 'docx';
     documentHasFile = false;
     docPassword = null;
     passwordLost = false;

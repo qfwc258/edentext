@@ -127,26 +127,48 @@ class MainActivity : AppCompatActivity() {
     private fun saveDownload(url: String, contentDisposition: String?, mimeType: String?) {
         try {
             val name = parseFileName(contentDisposition, url)
-            val dir = File(getExternalFilesDir(null), "Download").apply { mkdirs() }
-            val out = File(dir, name)
-            when {
-                url.startsWith("data:") -> {
-                    val comma = url.indexOf(',')
-                    if (comma < 0) return
-                    val base64 = url.substring(comma + 1)
-                    FileOutputStream(out).use {
-                        it.write(android.util.Base64.decode(base64, android.util.Base64.DEFAULT))
-                    }
-                }
-                else -> {
-                    Toast.makeText(this, "导出文件：${out.absolutePath}", Toast.LENGTH_LONG).show()
-                    return
-                }
+            // 保存子目录名（可在设置里改，默认“陈律文档”）
+            val prefs = getSharedPreferences("edentext", MODE_PRIVATE)
+            val subDir = prefs.getString("save_subdir", "陈律文档")?.takeIf { it.isNotBlank() } ?: "陈律文档"
+            if (!url.startsWith("data:")) {
+                Toast.makeText(this, "正在导出：$name", Toast.LENGTH_LONG).show()
+                return
             }
-            Toast.makeText(this, "已保存：${out.absolutePath}", Toast.LENGTH_LONG).show()
+            val comma = url.indexOf(',')
+            if (comma < 0) return
+            val bytes = android.util.Base64.decode(url.substring(comma + 1), android.util.Base64.DEFAULT)
+            val mime = mimeType ?: guessMime(name)
+
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                val resolver = contentResolver
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
+                    put(android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                        android.os.Environment.DIRECTORY_DOWNLOADS + "/$subDir")
+                }
+                val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: throw Exception("无法创建下载项")
+                resolver.openOutputStream(uri)?.use { it.write(bytes) }
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = java.io.File(
+                    android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
+                    subDir
+                ).apply { mkdirs() }
+                java.io.FileOutputStream(java.io.File(dir, name)).use { it.write(bytes) }
+            }
+            Toast.makeText(this, "已保存：Download/$subDir/$name", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             Toast.makeText(this, "保存失败：${e.message}", Toast.LENGTH_LONG).show()
         }
+    }
+
+    private fun guessMime(name: String): String = when {
+        name.endsWith(".docx", true) -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        name.endsWith(".odt", true) -> "application/vnd.oasis.opendocument.text"
+        name.endsWith(".pdf", true) -> "application/pdf"
+        else -> "application/octet-stream"
     }
 
     private fun parseFileName(cd: String?, url: String): String {
