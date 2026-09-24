@@ -1201,6 +1201,30 @@
       localStorage.setItem('edentext-zoom', String(zoom));
     }
 
+    // 手机双指捏合缩放编辑区（对接自带 zoom）
+    let pinchStartDist = 0;
+    let pinchStartZoom = 0;
+    const onPinchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        pinchStartDist = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+        pinchStartZoom = zoom;
+      }
+    };
+    const onPinchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2 && pinchStartDist > 0) {
+        const d = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+        setZoom(pinchStartZoom * (d / pinchStartDist));
+      }
+    };
+    window.addEventListener('touchstart', onPinchStart, { passive: true });
+    window.addEventListener('touchmove', onPinchMove, { passive: true });
+
     // Re-register the restored document's embedded fonts so it renders in the right face;
     // FontFace load fires 'loadingdone', which Editor.svelte re-paginates on. A file opened
     // while the store was still reading has its own, and registering would replace them.

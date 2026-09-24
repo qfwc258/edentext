@@ -38,6 +38,9 @@ type WinFs = Window & {
 };
 
 export function supportsFsAccess(): boolean {
+  // Android WebView 的 UA 含 "; wv"：该环境 File System Access API 虽存在但不弹窗，
+  // 强制走 <input type=file> 打开 + blob 下载保存，由原生壳对接系统文件选择器。
+  if (/; wv[)\s]|Android.*\bwv\b/i.test(navigator.userAgent)) return false;
   return typeof (window as WinFs).showSaveFilePicker === 'function';
 }
 
