@@ -750,31 +750,6 @@ html, body {
   html .statusbar .zoom-slider {
     width: 80px !important;
   }
-
-  /* ===== WPS 手机式：功能区整体固定屏幕底部 ===== */
-  /* ribbon 从顶部搬到屏幕最底：标签行贴底，功能面板向上弹出 */
-  html .ribbon {
-    position: fixed !important;
-    left: 0 !important;
-    right: 0 !important;
-    bottom: 0 !important;
-    top: auto !important;
-    z-index: 300;
-    display: flex !important;
-    flex-direction: column-reverse;
-    box-shadow: 0 -2px 14px rgba(0, 0, 0, .35);
-  }
-  html .ribbon .ribbon-tabs {
-    border-top: 1px solid rgba(255, 255, 255, .12);
-  }
-  /* 底部状态栏抬到 ribbon 标签栏上方，避免被压在底栏下 */
-  html .statusbar {
-    position: fixed !important;
-    left: 0;
-    right: 0;
-    bottom: 56px !important;
-    z-index: 290;
-  }
 }
 
 

@@ -27,12 +27,6 @@ export function closeMenu(): void {
 // inside the band it would cover the controls and group labels underneath.
 function dropTop(anchor: DOMRect, panel: HTMLElement): number {
   const band = panel.closest('.ribbon-body')?.getBoundingClientRect();
-  // 窄屏：ribbon 固定在屏幕底部，菜单改为向上弹（从 ribbon 顶部往上展开），
-  // 否则向下会弹出屏幕外。
-  if (typeof window !== 'undefined' && window.innerWidth < 820 && band) {
-    const h = panel.offsetHeight || 300;
-    return Math.max(8, band.top - h - 3);
-  }
   return Math.max(anchor.bottom, band?.bottom ?? 0) + 3;
 }
 

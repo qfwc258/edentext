@@ -470,7 +470,13 @@
       b.onclick = (e) => { e.preventDefault(); run(); };
       nav.appendChild(b);
     };
-    mkNavBtn('完成', () => { try { ed.commands.blur(); } catch { /* noop */ } }, true);
+    mkNavBtn('保存', () => {
+      const cur = documentName || '未命名';
+      const name = prompt('保存为（.docx）', cur);
+      if (!name) return;
+      documentName = name.replace(/\.docx$/i, '').trim() || cur;
+      void handleSaveAs('docx');
+    }, true);
     const spacer = document.createElement('span');
     nav.appendChild(spacer);
     const right = document.createElement('div');
