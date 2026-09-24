@@ -694,15 +694,10 @@ html, body {
     --w-ribbon-h: 56px;
   }
 
-  /* 功能区按钮一排排不下时，允许左右滑动而不是被挤出屏幕 */
+  /* 功能区：不裁剪纵向，保证字体/字号等下拉面板能弹出；按钮自动换行 */
   html .ribbon .ribbon-body {
-    overflow-x: auto !important;
-    overflow-y: hidden;
-    flex-wrap: nowrap !important;
-    scrollbar-width: none;
-  }
-  html .ribbon .ribbon-body::-webkit-scrollbar {
-    display: none;
+    overflow: visible !important;
+    flex-wrap: wrap !important;
   }
   html .ribbon .ribbon-body > * {
     flex-shrink: 0 !important;
