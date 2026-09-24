@@ -487,6 +487,10 @@
     nav.appendChild(right);
     document.body.appendChild(nav);
 
+    // 顶部导航条悬浮占位：让文档第一行不被它遮住
+    const mainEl = document.querySelector('main');
+    if (mainEl) (mainEl as HTMLElement).style.paddingTop = '52px';
+
     // 双击放大一档
     document.addEventListener('dblclick', () => setZoom(clampZoom(zoom + 25)));
 
