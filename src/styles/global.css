@@ -687,3 +687,38 @@ html, body {
   display: flex;
   flex-direction: column;
 }
+
+/* ===== 窄屏（手机 WebView）适配 ===== */
+@media (max-width: 820px) {
+  html {
+    --w-ribbon-h: 56px;
+  }
+
+  /* 功能区按钮一排排不下时，允许左右滑动而不是被挤出屏幕 */
+  html .ribbon .ribbon-body {
+    overflow-x: auto !important;
+    overflow-y: hidden;
+    flex-wrap: nowrap !important;
+    scrollbar-width: none;
+  }
+  html .ribbon .ribbon-body::-webkit-scrollbar {
+    display: none;
+  }
+  html .ribbon .ribbon-body > * {
+    flex-shrink: 0 !important;
+  }
+
+  /* 标签行：文档名收窄，避免挤压 */
+  html .ribbon .doc-name {
+    max-width: 30% !important;
+    overflow: hidden;
+  }
+
+  /* 功能区按钮整体稍紧凑 */
+  html .ribbon .toolbar-region button,
+  html .ribbon .qa-btn {
+    padding-left: 6px !important;
+    padding-right: 6px !important;
+  }
+}
+
