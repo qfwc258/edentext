@@ -5,21 +5,24 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.os.Message
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.webkit.WebViewAssetLoader
 import java.io.File
 import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
+    private lateinit var assetLoader: WebViewAssetLoader
     private var fileCallback: ValueCallback<Array<Uri>>? = null
 
     private val fileChooserLauncher = registerForActivityResult(
@@ -40,6 +43,13 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 关键：用 WebViewAssetLoader 把 assets 映射成 https 源。
+        // 直接 file:// 加载会被 CORS 拦截 ES Module 脚本（Svelte 应用挂载失败），
+        // 伪装成 https://appassets.androidplatform.net 后 module / wasm 才能正常加载。
+        assetLoader = WebViewAssetLoader.Builder()
+            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+            .build()
+
         web = WebView(this)
         setContentView(web)
 
@@ -57,22 +67,21 @@ class MainActivity : AppCompatActivity() {
         }
 
         web.webViewClient = object : WebViewClient() {
-            // 所有导航都留在 WebView 内，不跳出外部浏览器
+            override fun shouldInterceptRequest(
+                view: WebView?, request: WebResourceRequest?
+            ): WebResourceResponse? {
+                return assetLoader.shouldInterceptRequest(request?.url)
+            }
+
             override fun shouldOverrideUrlLoading(
-                view: WebView?, request: android.webkit.WebResourceRequest?
+                view: WebView?, request: WebResourceRequest?
             ): Boolean {
-                val url = request?.url?.toString() ?: return false
-                return if (url.startsWith("http://") || url.startsWith("https://")
-                    || url.startsWith("file://") || url.startsWith("about:")) {
-                    false // 留在 WebView
-                } else {
-                    true
-                }
+                // 应用内资源与同页导航一律留在 WebView 内
+                return false
             }
         }
 
         web.webChromeClient = object : WebChromeClient() {
-            // 应用内「打开文件」按钮 → 系统文件选择器
             override fun onShowFileChooser(
                 view: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
@@ -102,7 +111,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 「另存/导出」触发的下载 → 存到应用 Download 目录并提示
         web.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             saveDownload(url, contentDisposition, mimeType)
         }
@@ -113,7 +121,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        web.loadUrl("file:///android_asset/edentext/index.html")
+        web.loadUrl("https://appassets.androidplatform.net/assets/edentext/index.html")
     }
 
     private fun saveDownload(url: String, contentDisposition: String?, mimeType: String?) {
@@ -126,11 +134,9 @@ class MainActivity : AppCompatActivity() {
                     val comma = url.indexOf(',')
                     if (comma < 0) return
                     val base64 = url.substring(comma + 1)
-                    FileOutputStream(out).use { it.write(android.util.Base64.decode(base64, android.util.Base64.DEFAULT)) }
-                }
-                url.startsWith("http") -> {
-                    // 远程 URL（正常离线应用不会走到这里）
-                    Toast.makeText(this, "正在下载…", Toast.LENGTH_SHORT).show()
+                    FileOutputStream(out).use {
+                        it.write(android.util.Base64.decode(base64, android.util.Base64.DEFAULT))
+                    }
                 }
                 else -> {
                     Toast.makeText(this, "导出文件：${out.absolutePath}", Toast.LENGTH_LONG).show()
