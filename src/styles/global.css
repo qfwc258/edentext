@@ -690,14 +690,16 @@ html, body {
 
 /* ===== 窄屏（手机 WebView）适配 ===== */
 @media (max-width: 820px) {
-  html {
-    --w-ribbon-h: 56px;
+  /* ribbon 高度自适应，功能区多行完整显示，不再裁掉靠下的按钮 */
+  html .ribbon {
+    height: auto !important;
   }
 
   /* 功能区：不裁剪纵向，保证字体/字号等下拉面板能弹出；按钮自动换行 */
   html .ribbon .ribbon-body {
     overflow: visible !important;
     flex-wrap: wrap !important;
+    height: auto !important;
   }
   html .ribbon .ribbon-body > * {
     flex-shrink: 0 !important;
