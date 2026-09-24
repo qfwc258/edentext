@@ -720,5 +720,41 @@ html, body {
     padding-left: 6px !important;
     padding-right: 6px !important;
   }
+
+  /* 菜单标签行：标签多时可横向滑动，隐藏滚动条 */
+  html .ribbon .ribbon-tabs {
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex-wrap: nowrap !important;
+  }
+  html .ribbon .ribbon-tabs::-webkit-scrollbar {
+    display: none;
+  }
+  html .ribbon .ribbon-tab {
+    flex-shrink: 0;
+    font-size: 13px !important;
+  }
+
+  /* 底部状态栏：压缩高度与字号，隐藏不常用项，最大化编辑区 */
+  html .statusbar {
+    min-height: 34px !important;
+    height: 34px !important;
+    font-size: 11px !important;
+    padding: 0 6px !important;
+    gap: 6px !important;
+  }
+  /* 手机上隐藏文档语言选择与语法开关（非编辑必需） */
+  html .statusbar .sb-center {
+    display: none !important;
+  }
+  /* 隐藏字数统计（保留页码） */
+  html .statusbar .sb-left .wordcount-wrap {
+    display: none !important;
+  }
+  /* 缩放滑杆收窄但保留可拖 */
+  html .statusbar .zoom-slider {
+    width: 80px !important;
+  }
 }
+
 
