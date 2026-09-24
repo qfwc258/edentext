@@ -293,7 +293,10 @@
   let paragraphDialogOpen = $state(false);
   let tabsDialogOpen = $state(false);
 
-  let collapsed = $state(loadRibbonCollapsed());
+  // 手机窄屏默认折叠功能区，只留标签行，最大化编辑区；桌面保持用户上次选择
+  let collapsed = $state(
+    loadRibbonCollapsed() || (typeof window !== 'undefined' && window.innerWidth < 820)
+  );
   $effect(() => saveRibbonCollapsed(collapsed));
 
   function run(fn?: () => void) {

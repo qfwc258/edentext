@@ -1194,6 +1194,13 @@
   }
 
   onMount(() => {
+    // 手机 WebView：首次进入自动把 A4 文档缩放到适合屏宽（A4 约 794px 宽）
+    if (window.innerWidth < 820) {
+      const fit = Math.round((window.innerWidth - 16) / 7.94);
+      zoom = clampZoom(fit);
+      localStorage.setItem('edentext-zoom', String(zoom));
+    }
+
     // Re-register the restored document's embedded fonts so it renders in the right face;
     // FontFace load fires 'loadingdone', which Editor.svelte re-paginates on. A file opened
     // while the store was still reading has its own, and registering would replace them.
