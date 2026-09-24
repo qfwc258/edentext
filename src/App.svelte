@@ -432,13 +432,13 @@
     mobileChromeDone = true;
     const ed = editor;
 
-    // 选中文字时弹出的紧凑格式条
+    // 选中文字时弹出的紧凑格式条（白底，统一浅色观感）
     const bar = document.createElement('div');
-    bar.style.cssText = 'position:fixed;left:0;top:0;z-index:99999;display:none;align-items:center;background:#2b2b2e;color:#fff;border-radius:10px;padding:4px;box-shadow:0 4px 16px rgba(0,0,0,.45);';
+    bar.style.cssText = 'position:fixed;left:0;top:0;z-index:99999;display:none;align-items:center;background:#ffffff;color:#222;border:1px solid #e2e2e6;border-radius:10px;padding:4px;box-shadow:0 4px 16px rgba(0,0,0,.18);';
     const mkBtn = (label: string, run: () => void) => {
       const b = document.createElement('button');
       b.textContent = label;
-      b.style.cssText = 'border:none;background:transparent;color:#fff;font-size:16px;font-weight:600;min-width:34px;height:34px;border-radius:6px;';
+      b.style.cssText = 'border:none;background:transparent;color:#222;font-size:16px;font-weight:600;min-width:34px;height:34px;border-radius:6px;';
       b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); run(); };
       bar.appendChild(b);
     };
@@ -460,19 +460,32 @@
     };
     document.addEventListener('selectionchange', positionBar);
 
-    // 右下角浮动撤销 / 重做（拇指热区）
-    const fab = document.createElement('div');
-    fab.style.cssText = 'position:fixed;right:10px;bottom:56px;z-index:99999;display:flex;flex-direction:column;gap:8px;';
-    const mkFab = (label: string, run: () => void) => {
+    // 顶部导航条（参考 WPS：完成 / 撤销 / 重做）
+    const nav = document.createElement('div');
+    nav.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;display:flex;align-items:center;justify-content:space-between;background:#ffffffee;color:#222;border-bottom:1px solid #e2e2e6;padding:6px 12px;box-shadow:0 1px 6px rgba(0,0,0,.08);';
+    const mkNavBtn = (label: string, run: () => void, bold = false) => {
       const b = document.createElement('button');
       b.textContent = label;
-      b.style.cssText = 'width:44px;height:44px;border-radius:50%;border:none;background:#2f6fed;color:#fff;font-size:18px;box-shadow:0 3px 10px rgba(0,0,0,.4);';
+      b.style.cssText = `border:none;background:transparent;color:${bold ? '#2f6fed' : '#222'};font-size:15px;font-weight:${bold ? 700 : 400};padding:8px 10px;`;
       b.onclick = (e) => { e.preventDefault(); run(); };
-      fab.appendChild(b);
+      nav.appendChild(b);
     };
-    mkFab('↶', () => ed.chain().focus().undo().run());
-    mkFab('↷', () => ed.chain().focus().redo().run());
-    document.body.appendChild(fab);
+    mkNavBtn('完成', () => { try { ed.commands.blur(); } catch { /* noop */ } }, true);
+    const spacer = document.createElement('span');
+    nav.appendChild(spacer);
+    const right = document.createElement('div');
+    right.style.cssText = 'display:flex;gap:4px;';
+    const mkNavSide = (label: string, run: () => void) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = 'border:none;background:transparent;color:#222;font-size:20px;width:40px;height:40px;';
+      b.onclick = (e) => { e.preventDefault(); run(); };
+      right.appendChild(b);
+    };
+    mkNavSide('↶', () => ed.chain().focus().undo().run());
+    mkNavSide('↷', () => ed.chain().focus().redo().run());
+    nav.appendChild(right);
+    document.body.appendChild(nav);
 
     // 双击放大一档
     document.addEventListener('dblclick', () => setZoom(clampZoom(zoom + 25)));

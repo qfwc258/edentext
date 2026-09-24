@@ -21,6 +21,8 @@ export const MAX_PAGE_COLUMNS = 4;
 export function loadTheme(): ThemeMode {
     const saved = localStorage.getItem(THEME_KEY);
   if (saved === 'light' || saved === 'dark' || saved === 'allBlack' || saved === 'auto') return saved;
+  // 手机窄屏默认浅色（WPS 式白底文档观感）；桌面端仍跟随系统
+  if (typeof window !== 'undefined' && window.innerWidth < 820) return 'light';
   return 'auto';
 }
 

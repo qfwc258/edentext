@@ -6,6 +6,8 @@ import { locale } from '../../i18n/i18n.svelte';
 
 export const WEB_SAFE_FONTS: readonly string[] = [
   'Liberation Serif', 'Arial', 'Verdana', 'Trebuchet MS', 'Georgia', 'Times New Roman', 'Courier New',
+  // 公文常用：常显，导出 docx 后在电脑 Word 中按对应字体渲染
+  'FangSong', 'FZXiaoBiaoSong-B05S',
 ];
 const WEB_SAFE_SET = new Set<string>(WEB_SAFE_FONTS);
 
@@ -74,6 +76,7 @@ const CJK_FONT_LABELS: Record<string, { 'zh-Hans': string; 'zh-Hant': string }> 
   SimHei: { 'zh-Hans': '黑体', 'zh-Hant': '黑體' },
   KaiTi: { 'zh-Hans': '楷体', 'zh-Hant': '楷體' },
   FangSong: { 'zh-Hans': '仿宋', 'zh-Hant': '仿宋' },
+  'FZXiaoBiaoSong-B05S': { 'zh-Hans': '小标宋', 'zh-Hant': '小標宋' },
   DengXian: { 'zh-Hans': '等线', 'zh-Hant': '等線' },
   'DengXian Light': { 'zh-Hans': '等线 Light', 'zh-Hant': '等線 Light' },
   'Microsoft YaHei': { 'zh-Hans': '微软雅黑', 'zh-Hant': '微軟雅黑' },
