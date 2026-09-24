@@ -54,14 +54,18 @@ function download(bytes: Uint8Array, name: string, mime: string): void {
     alert(t().ribbon.saveAsHint);
   }
   const blob = new Blob([bytes as Uint8Array<ArrayBuffer>], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  // 转成 data: URL：安卓 WebView 的下载监听拿不到 blob: 链接的字节，
+  // 只有 data:（base64）能被原生壳解码后写到 Download/陈律文档。
+  const reader = new FileReader();
+  reader.onload = () => {
+    const a = document.createElement('a');
+    a.href = reader.result as string;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+  };
+  reader.readAsDataURL(blob);
 }
 
 async function writeHandle(handle: FileSystemFileHandle, bytes: Uint8Array): Promise<void> {
