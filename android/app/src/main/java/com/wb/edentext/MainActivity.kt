@@ -70,7 +70,7 @@ class MainActivity : AppCompatActivity() {
             override fun shouldInterceptRequest(
                 view: WebView?, request: WebResourceRequest?
             ): WebResourceResponse? {
-                return assetLoader.shouldInterceptRequest(request?.url)
+                return request?.url?.let { assetLoader.shouldInterceptRequest(it) }
             }
 
             override fun shouldOverrideUrlLoading(
