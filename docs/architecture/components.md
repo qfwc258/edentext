@@ -1,0 +1,119 @@
+# Components
+
+`App.svelte` owns persisted document and application state. `Editor.svelte` mounts TipTap
+and owns editor-local layout: pagination wiring, zoom, floating tools, and page layers.
+Read `docs/architecture/pagination.md`, `ribbon.md`, `frames.md`, `tables.md`,
+`formatting.md`, `formulas.md`, and `notes.md` before changing their respective features.
+
+## Ownership and data flow
+
+`chromeMode` selects either the floating toolbar or `ribbon/`; only one mounts. Both route
+commands through `activeEditor` and `activeTick`, so the same controls work for the body and
+an active header/footer zone. `App.svelte` owns zoom, page setup, theme, formatting-mark and
+document state and passes it into `Editor.svelte`.
+
+`Editor.svelte` exposes `editor`, `tick`, `currentPage`, and `numPages` as bindable props.
+`tick` advances for every TipTap transaction; toolbar components derive their state from it
+instead of subscribing to ProseMirror. Defer the caret-page lookup one task after selection
+changes: reading coordinates in the transaction handler can force a full layout during load.
+
+## Layout lifecycle
+
+Pagination measures DOM that its prior pass changed. While an opened document converges,
+`.paper.settling` hides content without removing it from layout. Stop when the layout
+signature repeats or the bounded settle time expires. Re-arm on `documentEpoch` when opening a
+document, not on ordinary edits; sample only a bounded number of blocks so measurement does
+not starve the layout it is waiting for.
+
+Zoom is `transform: scale()` on `.paper`; pagination always measures unscaled geometry.
+`.paper-scaler` reserves the transformed footprint for centering and scrollbars. `App.svelte`'s
+`setZoom` is the sole writer and persists the clamped range. Pointer zoom preserves the point
+under the cursor; keyboard, buttons, and slider preserve the viewport anchor.
+
+Keep `pageBreaks.ts`, `Editor.svelte`, and `editor.css` page constants aligned. Section paper
+dimensions remain unrounded: pagination uses the published value directly and cumulative
+rounding changes later page positions.
+
+## Multiple views
+
+### Split view
+
+Split is horizontal only. The second pane is an `EditorView` over the editor's state and is
+kept in sync by the primary view; it is not an independent document editor.
+
+- One view measures and paginates. `pageBreaks`, columns, and tab-stop plugins must be inert
+  in the other pane because they share decorations and derived state.
+- Widget decorations must create DOM in a factory. Two views cannot share one element.
+- `activePane` owns coordinate reads, focus restoration, and scroll-to-selection. A command
+  otherwise focuses the primary TipTap view and scrolls the wrong pane.
+- Persist only whether split is enabled, not its temporary divider position.
+
+### Page grid
+
+Grid cells are clipped windows onto whole-document views: a column contains non-contiguous
+pages, so it cannot be one view. Reuse two rows of cells while scrolling. Split and grid are
+mutually exclusive.
+
+- One scroller carries the canvas and defines the coordinate space for floating layers.
+- The focused view must be the cell displaying the caret's page; other cells clip it away.
+- A pane may dispatch only document, selection, or stored-mark changes caused by its user.
+  Viewport-derived plugin state otherwise makes shared panes transact against each other.
+- Move the primary editor view to the first host when the layout changes rather than rebuilding
+  it. Do not render the ruler in every grid cell.
+
+## Header and footer
+
+Headers and footers are independent single-paragraph TipTap documents. One live zone editor
+serves the active zone; inactive zones render static HTML. Their typography inherits the
+document default paragraph style, not the editor fallback.
+
+Zones live inside scaled `.paper` but use unscaled document coordinates. Page fields are
+patched per page. Keep only a window near the current page for normal editing, then expand it
+for DOM capture and browser printing so every page is present.
+
+Sections own their header/footer set, distances, and first-page variants. The selected zone is
+the section on the page being edited; a section with different margins must position its zone
+from those margins. The body reach is measured from off-screen rendered zone copies, including
+wrapping and internal spacing, rather than inferred from line counts.
+
+## Review UI
+
+Comments and revisions have a pane or margin representation, never both. Panes use shared
+cards and synchronize their active row with the text selection; changes can be accepted or
+rejected and comments answered, resolved, or edited from either representation.
+
+`reviewItems.ts` is the only source for markup visibility. CSS hiding and revision decorations
+must change together, and a display-mode change dispatches pagination recalculation because it
+changes flow.
+
+Margin balloons sit beside `.paper`, inside the scaled canvas, so page content can remain the
+pagination width. Reserve their strip only when visible markup needs it. Group and stack cards
+per page using measured heights; cards scroll internally before a page column may overflow.
+Grid view omits balloons because cells clip to page width. The connector shows only the active
+item and is omitted when its geometry cannot be unambiguous.
+
+Change bars, fold marks, line numbers, page decoration, and header/footer backgrounds render
+inside `.paper` so raster export and printing include them. Line numbering deliberately excludes
+tables and floating frames; it derives lines from range rectangles and must be remeasured after
+edits and pagination settles.
+
+## Secondary features
+
+The Navigator derives its outline from `editor/extensions/outline.ts` and performs chapter
+operations on the selected entry. AutoText stores the selected slice as JSON and inserts it
+through its dialog. The synonym dialog loads data lazily for the selected language; unavailable
+data disables lookup rather than the application.
+
+Applying a built-in template resets document state, then applies its content, settings, and
+styles. It clears the file association so the first save chooses a destination. Template schema
+and geometry checks belong in their focused tests.
+
+The unsaved indicator compares export-relevant state with a synchronous saved baseline. Later
+checks are throttled so ongoing layout work does not prevent them; exclude layout-only results
+such as page count. Opening, creating, and saving a document establish a new baseline.
+
+## Debug tooling
+
+Development builds can download a JSON snapshot of pagination, table and frame geometry,
+stylesheet and spacing state, and rendered colour diagnostics. Keep it diagnostic-only and out
+of production UI.

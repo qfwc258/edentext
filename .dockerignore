@@ -1,0 +1,6 @@
+node_modules
+dist
+coverage
+debug
+docs/showcase
+.git

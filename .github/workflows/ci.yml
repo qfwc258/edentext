@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # CLAUDE.md is read at every session start; detail belongs in the nested files.
+      - run: test "$(wc -l < CLAUDE.md)" -le 120 || { echo "CLAUDE.md over its 120-line budget"; exit 1; }
+      # The corpus is gitignored, so a test reading it would name a document and fail here.
+      - run: |
+          ! git grep -l "render-parity/fixtures" -- src tests ':!tests/render-parity' \
+            || { echo "a test reads the gitignored parity corpus"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      # xmllint drives the schema-validation leg (it self-skips without it).
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
+      # LibreOffice is not installed here, so the lo-roundtrip suite self-skips
+      # (the lo-roundtrip job below runs that leg).
+      - run: npm test
+
+  # The LibreOffice legs (self-skipping everywhere soffice is absent) and the layout run,
+  # which holds the editor's page counts against LibreOffice's PDFs in Chromium.
+  lo-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # libreoffice-math builds the formula objects both importers read back (without it
+      # Writer drops every formula); poppler-utils rasterizes the render-consistency PDFs.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer libreoffice-math fonts-liberation poppler-utils
+      - run: npm ci
+      - run: npm run test:lo
+      - run: npx playwright-core install --with-deps chromium
+      - run: npm run test:layout
+
+  # Production build booted in the three engines behind the supported browsers
+  # (vite build.target). WebKit runs on macOS: its text shaping there is Safari's.
+  browser:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { browser: chromium, os: ubuntu-latest }
+          - { browser: firefox, os: ubuntu-latest }
+          - { browser: webkit, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      BROWSER: ${{ matrix.browser }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright-core install --with-deps ${{ matrix.browser }}
+      - run: npm run build
+      - run: npm run test:smoke
+      - run: npm run test:dom
+      # xmllint validates the files the monkey saves (macOS ships it).
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
+      - run: npm run test:monkey

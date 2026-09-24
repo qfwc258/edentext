@@ -1,0 +1,271 @@
+<script lang="ts">
+  import type { Editor } from '@tiptap/core';
+  import { activeBorderPresets, type BorderPreset } from '../editor/extensions/tableCellBorders';
+  import { t } from '../i18n/i18n.svelte';
+  import ColorPicker from './ColorPicker.svelte';
+
+  let { editor, tick }: { editor: Editor | null; tick: number } = $props();
+
+  let open = $state(false);
+  // Pen settings: presets apply with the currently chosen width/color.
+  let widthPt = $state(0.5);
+  let color = $state('#000000');
+
+  const WIDTHS = [0.5, 1, 1.5, 2.25, 3];
+  // Preset icons: 6 segments (outer edges + the two inner grid lines); "on" segments
+  // draw solid, the rest as faint guides.
+  type Seg = 'top' | 'right' | 'bottom' | 'left' | 'h' | 'v';
+  const SEG_PATH: Record<Seg, string> = {
+    top: 'M1 1H17', right: 'M17 1V17', bottom: 'M1 17H17', left: 'M1 1V17',
+    h: 'M1 9H17', v: 'M9 1V17',
+  };
+  const ALL_SEGS: Seg[] = ['top', 'right', 'bottom', 'left', 'h', 'v'];
+  const PRESETS: { id: BorderPreset | 'none'; on: Seg[] }[] = [
+    { id: 'all', on: ['top', 'right', 'bottom', 'left', 'h', 'v'] },
+    { id: 'outer', on: ['top', 'right', 'bottom', 'left'] },
+    { id: 'inner', on: ['h', 'v'] },
+    { id: 'innerH', on: ['h'] },
+    { id: 'innerV', on: ['v'] },
+    { id: 'top', on: ['top'] },
+    { id: 'bottom', on: ['bottom'] },
+    { id: 'left', on: ['left'] },
+    { id: 'right', on: ['right'] },
+    { id: 'none', on: [] },
+  ];
+
+  // Button states, re-read per transaction (tick) and pen change: a preset
+  // is active when its boundaries all render the pen border; 'none' when borderless.
+  const active = $derived(
+    tick >= 0 && editor ? activeBorderPresets(editor.state, { widthPt, color }) : null,
+  );
+
+  // Clicking an inactive preset applies the pen; clicking an active one toggles those
+  // borders off. The panel stays open so the states visibly update.
+  function apply(id: BorderPreset | 'none') {
+    if (!editor) return;
+    if (id === 'none') editor.chain().focus().setTableBorders('all', null).run();
+    else if (active?.[id]) editor.chain().focus().setTableBorders(id, null).run();
+    else editor.chain().focus().setTableBorders(id, { widthPt, color }).run();
+  }
+
+  function clickOutside(node: HTMLElement) {
+    function handler(e: MouseEvent) {
+      if (!node.contains(e.target as Node)) open = false;
+    }
+    window.addEventListener('mousedown', handler);
+    return { destroy() { window.removeEventListener('mousedown', handler); } };
+  }
+</script>
+
+<div class="border-picker" use:clickOutside>
+  <button
+    class="bp-trigger"
+    class:active={open}
+    title={t().borders.title}
+    aria-label={t().borders.title}
+    aria-expanded={open}
+    onclick={() => (open = !open)}
+  >
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+      <rect x="1.5" y="1.5" width="15" height="15" stroke="currentColor" stroke-width="1.3"/>
+      <path d="M9 1.5V16.5" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.9 1.375"/>
+      <path d="M1.5 9H16.5" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.9 1.375"/>
+    </svg>
+    <svg class="bp-chevron" width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
+      <path d="M1 2.5l3 3 3-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </button>
+
+  {#if open}
+    <div class="bp-dropdown">
+      <div class="bp-title">{t().borders.title}</div>
+      <div class="bp-presets">
+        {#each PRESETS as preset}
+          <button
+            class="bp-preset"
+            class:active={!!active?.[preset.id]}
+            title={t().borders[preset.id]}
+            aria-label={t().borders[preset.id]}
+            aria-pressed={!!active?.[preset.id]}
+            onclick={() => apply(preset.id)}
+          >
+            {#if preset.id === 'none'}
+              <!-- Prohibition sign over a faint grid: unmistakably "remove borders". -->
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                {#each ALL_SEGS as seg}
+                  <path d={SEG_PATH[seg]} stroke="currentColor" stroke-width="1" opacity="0.22" stroke-dasharray="2 1.5"/>
+                {/each}
+                <circle cx="9" cy="9" r="5.5" fill="var(--color-surface)" stroke="currentColor" stroke-width="1.3"/>
+                <path d="M5.2 12.8L12.8 5.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+              </svg>
+            {:else}
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                {#each ALL_SEGS as seg}
+                  {#if !preset.on.includes(seg)}
+                    <path d={SEG_PATH[seg]} stroke="currentColor" stroke-width="1" opacity="0.22" stroke-dasharray="2 1.5"/>
+                  {/if}
+                {/each}
+                {#each preset.on as seg}
+                  <path d={SEG_PATH[seg]} stroke="currentColor" stroke-width="1.7"/>
+                {/each}
+              </svg>
+            {/if}
+          </button>
+        {/each}
+      </div>
+
+      <div class="bp-title">{t().borders.lineWidth}</div>
+      <div class="bp-widths">
+        {#each WIDTHS as w}
+          <button
+            class="bp-width"
+            class:active={widthPt === w}
+            title={t().borders.pt(w)}
+            aria-label={t().borders.pt(w)}
+            aria-pressed={widthPt === w}
+            onclick={() => (widthPt = w)}
+          >
+            <span class="bp-width-line" style="height: {Math.max(1, Math.round((w * 96) / 72))}px"></span>
+          </button>
+        {/each}
+      </div>
+
+      <div class="bp-title">{t().borders.lineColor}</div>
+      <ColorPicker
+        editor={null}
+        currentColor={color}
+        defaultColor={color}
+        title={t().borders.lineColor}
+        chevronTitle={t().borders.lineColor}
+        clearLabel={t().color.automatic}
+        onApply={(c) => (color = c)}
+        onClear={() => (color = '#000000')}
+      />
+    </div>
+  {/if}
+</div>
+
+<style>
+  .border-picker {
+    position: relative;
+  }
+
+  .bp-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1px;
+    height: 1.7rem;
+    min-width: unset;
+    padding: 0 3px;
+    border: none;
+    border-radius: calc(var(--radius) - 2px);
+    background: transparent;
+    color: var(--color-text);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .bp-trigger:hover,
+  .bp-trigger.active {
+    background: var(--color-btn-hover);
+  }
+
+  .bp-chevron {
+    flex-shrink: 0;
+  }
+
+  .bp-dropdown {
+    position: absolute;
+    top: calc(100% + 3px);
+    left: 0;
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  }
+
+  .bp-title {
+    padding: 0.1rem 0.2rem 0.2rem;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    user-select: none;
+  }
+
+  .bp-presets {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 2px;
+  }
+
+  .bp-preset {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.9rem;
+    height: 1.9rem;
+    min-width: unset;
+    padding: 0;
+    border: 1px solid var(--color-border);
+    border-radius: calc(var(--radius) - 2px);
+    background: transparent;
+    color: var(--color-text);
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+
+  .bp-preset:hover {
+    background: var(--color-btn-hover);
+  }
+
+  .bp-preset.active {
+    outline: 2px solid var(--color-primary);
+    outline-offset: -1px;
+  }
+
+  .bp-widths {
+    display: flex;
+    gap: 2px;
+  }
+
+  .bp-width {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    height: 1.4rem;
+    min-width: unset;
+    padding: 0 4px;
+    border: 1px solid var(--color-border);
+    border-radius: calc(var(--radius) - 2px);
+    background: transparent;
+    color: var(--color-text);
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+
+  .bp-width:hover {
+    background: var(--color-btn-hover);
+  }
+
+  .bp-width.active {
+    outline: 2px solid var(--color-primary);
+    outline-offset: -1px;
+  }
+
+  .bp-width-line {
+    display: block;
+    width: 100%;
+    background: currentColor;
+  }
+
+</style>

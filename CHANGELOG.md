@@ -1,0 +1,581 @@
+# Changelog
+
+<!-- Newest release first. New entries go here: ## [x.y.z] — YYYY-MM-DD -->
+
+## [0.6.0] — 2026-09-21
+
+Chinese, in both scripts and on both sides of the document: the UI speaks it, a paragraph can be
+written in it, and its lists, fonts, paper and line breaking follow. Around it, a movable link
+window, a ribbon tab for the running head, and British English.
+
+### Added
+- **Simplified and Traditional Chinese as program languages**, with Chinese font names in the
+  picker, 「」 quotes in zh-Hant, and an index headed in the app's language
+- **Chinese as a document language**, dictionary or not: it is written to the asian slot, its text
+  is set from the asian font, Han characters count singly, and words break at the next Han character
+- **Chinese list numbering** (一、壹、甲、①), 16K and 32K paper, and date, currency and table
+  language following the locale
+- **British English** as a second spell-check language
+- **A ribbon tab for the header and footer**, with a dated running head and tab stops set from the ruler
+- **A movable link window**, and a US business letter template whose fold marks appear only where they fit
+
+### Fixed
+- A tab no longer counts its own advance twice, and Shift-Tab stays inside a header/footer zone
+- The columns flow no longer rejoins a boundary it just split
+- The layout menus show what a section actually sets, an empty page-number start says what it means,
+  and a page-number change stays out of a second footer line
+- A text box keeps its font on CJK text; the language box names the state it is in when checking is off
+
+### Changed
+- A container image is published for each release
+
+## [0.5.0] — 2026-09-19
+
+The weight of this release is the cross-reference: every target type a word processor offers,
+inserted from a movable window and kept alive through both formats. Beside it, four more program
+languages with their dictionaries, a grammar check, a language per paragraph, and a pass over the
+section and page geometry that a mixed-paper document depends on.
+
+### Added
+- **Cross-references and bookmarks** — a movable window offers every target type (headings,
+  numbered paragraphs, bookmarks, captions per category, foot- and endnotes) in every reference
+  format ODF names. References and their targets survive both formats, a LibreOffice document's
+  own reference marks resolve, and a reference draws as the field it is
+- **Spanish, French, Portuguese and Russian as program languages** — the globe picker offers
+  Español, Français, Português (Portugal) and Русский, and the whole UI follows: ribbon, dialogs,
+  context menus, built-in templates, number formats and date fields (a Slavic locale in the
+  genitive a date is printed in). Each comes with Hunspell spell check and a MyThes thesaurus,
+  the AutoCorrect quotes and currency its locale names, and saves as its own tag
+- **Grammar and style check** (harper.js, local, no server): a switch beside the language picker
+  turns it on, blue waves mark what it finds, and the context menu offers the fixes. **English
+  only** — the engine carries its rules in code, so it greys out elsewhere and says so. Off by
+  default: it downloads a 16 MB model once, and lints in a worker off the main thread
+- **A language per paragraph and per run**, as LibreOffice and Word both carry it: the picker
+  follows the cursor and sets the paragraph or the selection, "For all text" takes the document
+  back to one language. Round-trips as `fo:language`/`w:lang`, a language we have no dictionary
+  for included, and each run is spelled against its own dictionary
+- **Field shading** (View ▸ Field Shadings) — LibreOffice's grey ground on every field, header
+  and footer included; it persists, and print and PDF drop it
+
+### Fixed
+
+**Sections and page geometry**
+- A table or an index can open a section, and a section ending inside a content control is found,
+  so a later section no longer renders the page setup of the one before it
+- Headings and the index are inset by their section's side margins, and a page-anchored frame is
+  placed from its own page's corner rather than the sheet's
+- A DOCX table takes the percentage width it declares, and a list item its own indent over the
+  numbering level's
+- An index is bounded by its own page's content band, and a long entry wraps instead of being cut
+
+**Import and export**
+- Word's `w:noBreakHyphen` and `w:softHyphen` arrive as characters
+- A footer text box keeps its field — Word's page number among them — when the zone is flattened
+- An embedded object whose doctype merely names a DTD is read; only entity declarations are refused
+- A floating ODF frame stays where it sits in the text, and a paragraph reads its language from
+  `Standard` rather than the family default
+
+**Editing**
+- Enter after a forced page break no longer opens another page
+- Pasted blocks reach a header/footer zone, a note and a text box instead of being wrapped or dropped
+- Whole-word search bounds a word by Unicode, and a search jumps to its result
+
+### Security
+- A hardening pass over the importers: archive expansion, XML nesting and entities, structural
+  integers, TIFF decoding, table formula references and encrypted containers are bounded or
+  validated, pasted remote image sources are dropped, and text box and stylesheet values sanitized
+
+## [0.4.0] — 2026-09-12
+
+The weight of this release is the cover page: frames placed against the page, shape colours out
+of the document's theme, floating tables and drawing groups now arrive as the file draws them. A
+saved document also carries the fonts it was opened with.
+
+### Added
+- A saved file embeds the fonts it was opened with — TTFs under `Fonts/` in ODF, obfuscated
+  `.odttf` parts in `.docx` — so it keeps its look on a machine without them; the font picker
+  lists the embedded families
+- A drawing group (`wpg:wgp`) opens as the frames it holds
+- A floating table (`w:tblpPr`) opens as the box that holds it, and both exporters write it back
+- Behind and in front of the text are offered as wrap modes on both frame toolbars and in the
+  ribbon's Arrange group, each pickable and draggable where it sits
+- A text box anchors its text top, middle or bottom (Shape Format), carried by both formats
+- Every version tag publishes the built app as an archive on its GitHub release: unzip, point a
+  web server at the folder
+
+### Changed
+- The header/footer layer draws one box per zone instead of two, 150 fewer placed boxes per pass
+
+### Fixed
+
+**Frames and shapes**
+- A frame placed against the page lands there rather than at its anchor paragraph
+- A shape's fill and stroke resolve the document's theme, the per-channel modifiers included
+- A frame behind the text can be picked again, and a right-click over one opens the context menu
+- A line shape of no height draws again, and is saved flat instead of across its frame's diagonal
+- Setting a wrap mode, resizing, rotating or editing a formula keeps the selection, so the
+  floating toolbar and the contextual tab stay up
+
+**Headers and footers**
+- A header zone is as tall as the row the file draws it in (`w:trHeight`)
+- A `.docx` zone keeps the space above its first line, so a tall header reopens at its height
+- A header/footer table's text and rule line reach the zone
+- The whole margin band opens the zone on a double-click, and an empty zone's placeholder sits on
+  the line the caret lands on
+
+**Elsewhere**
+- Ctrl+K, the context menu and a double-click on a formula reach their dialogs from any ribbon tab
+- A heading in a table cell keeps the spacing its file gives it
+- A date or time format outside the picker's catalog stays a live field
+- Enter keeps an empty line inside a columns section
+- A long ribbon label widens its button instead of painting across its neighbour
+
+## [0.3.0] — 2026-09-09
+
+The weight of this release is the latency of a long document: it opens and settles in a
+fraction of the time it took, and typing is no longer held up by the pagination behind it
+— the measurements are under Changed. Beside that, each browser tab edits its own
+document.
+
+### Added
+- Each browser tab edits its own document: a second tab opens an empty one instead of the
+  first tab's, each keeps its own across a reload, and a new tab takes up what a closed one held
+- Saving a document that has no file asks which format to write, `.odt` or `.docx`
+- Closing the tab warns where the document has never been saved to a file
+- The site counts anonymous visits (GoatCounter), and a sponsor button points at the
+  project's PayPal link
+
+### Changed
+- **Opening a file.** The archive is inflated once for the whole open instead of once per
+  pass and pictures are encoded by the browser (−480 ms on a 14 MB file holding 600 of
+  them); the fields of a pass — every index's page numbers, every cross-reference, every
+  zone's tab stops — measure together and write on one transaction; one ResizeObserver
+  refits every frame; a pass that finds the layout it announced last time stays quiet; the
+  ribbon looks for a mounted panel only where one can be; the header/footer layer draws a
+  window of pages around the one being read rather than a zone box on all 460; and the
+  whole-document spell check waits for idle time and for the pagination to stop
+- **Typing.** An edit's pass waits for 300 ms of quiet instead of running between keys, an
+  edit that leaves the content's bottom where it was skips the pass entirely, the spacers
+  are mapped and keyed so a pass that lands the same ones keeps their DOM, and the check
+  after a pause re-reads the edited paragraphs rather than the document. At the top of a
+  124-page file a keystroke costs 41 ms, down from 219 ms; the pause after it 11 ms in
+  Chromium and 17 ms in Firefox, down from 363 ms and 1.4 s
+- The caret's page is read after the frame rather than before it, and a `:has()` rule that
+  made Chromium restyle the whole body on every inserted child is gone
+
+### Fixed
+- A page-anchored frame no longer crashes the editor while a saved document loads
+- A bracket typed without `\left` keeps its glyph height
+
+## [0.2.0] — 2026-09-06
+
+Everything since the 0.1.0 launch on GitHub Pages. The weight of the release is interoperability:
+an exported file opens in Word without a repair prompt and renders in LibreOffice the way EdenText
+draws it, down to the header band and the page a chapter opens on. Beside that, named list styles,
+chapter numbering, the letter templates, password protection, comment threads with margin balloons
+and a book layout.
+
+### Added
+- Named list styles ("Listenformatvorlagen") as the fourth style family: up to ten levels per style, bullet and numbered levels mixed, edited in the style manager's own tab and assigned from the two list dropdowns. Built-ins List Bullet / List Number / Numbering 123 / Numbering 1.a.i, plus a preset gallery of patterns the depth cycle cannot produce (the outline chains I.A.1 and A.I.1, kind-mixing Numbering with Bullets, Checklist, the Diamond ladder). A style's own level decides a depth's kind, so a nested list follows the definition rather than the node it was typed as. Round-trips as ODF `<text:list-style>` and as a Word numbering style (`w:styleLink`/`w:numStyleLink` — a linked abstract used to import as a plain bullet list)
+- Chapter numbering: headings carry the number their document defines — format, prefix and suffix, levels shown and start value per level — set in the level's own character style, indent and tab stop, and the contents rows count the same way. Round-trips as ODF `text:outline-style` and as Word's multilevel numbering bound to the heading styles; a numbered heading crosses into `.docx` as a heading (`w:outlineLvl`), not a list item
+- Letter templates (File ▸ New): a template gallery offering the DIN 5008 business letter in both forms the norm defines — Form B for a full letterhead, Form A opening its address field at 27mm for a one-line one — and a personal letter. Address window, notation zone and info block are mm-pinned and headlessly measured; four further drafts (cover letter, CV, invoice, minutes) are built and tested but shelved out of the gallery for now
+- Placeholder fields: an inline atom drawn as ‹label› that marks what to fill in ("Empfängername") — a click selects the whole field, typing replaces it, Tab and Shift-Tab jump between fields. Round-trips as ODF `<text:placeholder>` and a Word content control
+- Fold and punch marks (Falzmarken/Lochmarke, DIN 5008) at both page edges, drawn inside the paper so print and PDF carry them, and round-tripped in both formats
+- Password protection: a document saves encrypted in both formats — ODF in LibreOffice's whole-package form (AES-256-GCM keyed by Argon2id), DOCX as Word's agile encryption inside a compound file written here — and the older forms (ODF's per-entry PBKDF2, Word's standard encryption) open too. Opening a protected file asks for the password, the password is never stored, and a reload keeps the protection so the next save asks again. Verified against LibreOffice in both directions
+- Comment threads and margin balloons: a comment carries its replies (ODF `loext:parent-name`, Word `w15:paraIdParent`), a bar in the margin marks every line a change or an open comment covers, and each card sits as a balloon beside its own line or in the reviewing pane, with a dashed leader to the one at the caret. The Review tab picks per kind whether it shows and where, plus Word's four display modes; print and PDF carry the bars and a page-numbered comment list, switchable with "Print markup"
+- Book layout: a mirrored-margins switch (inner/outer) in both margin UIs, a section that opens on a right or left page with the blank page inserted (ODF `style:page-usage`, Word's odd/even-page section break, in the Breaks menu), a page-number format per section (a roman front matter before a decimal body) and header/footer distances per section. The side of a page follows its printed number, as LibreOffice decides it
+- A text box sits in the line of text: an inline node carrying blocks, so it reaches a table cell or a list item and survives AutoText and a paste from another window. An in-line or top-bottom-wrapped box takes a left/centre/right placement in both formats, and the caret can reach the position beside a box that starts its paragraph
+- LibreOffice's page-start spacing option (ODF `AddParaTableSpacingAtStart`, Word `w:suppressSpBfAfterPgBrk`): off, the block opening a page loses its space above; both formats carry it
+- Save As offers both document formats, one entry per format — the extension decides which exporter runs and which format the document keeps, and the first save of a new document is a Save As
+- "• Not saved" beside the document name, a checksum over the text, page setup, styles and name: a margin preset or a rename marks the document as a keystroke does, and an undo back to the saved state clears it
+- The autosave keeps the last three versions of the document (one every five minutes, in IndexedDB), offered when the browser copy fails to load; a document that hung the editor is offered another try before it is parked
+- The header and footer options in the ribbon: the two variant flags (a first page of its own, separate even pages) and the two distances sit in an Options menu beside the zone buttons on the Insert tab, reachable without the expanded toolbar
+
+### Changed
+- The ribbon is the chrome a first visit opens; the floating island ("Modern") is offered in development builds only until it catches up, and a stored preference for it keeps working
+- A first run picks its spell-check language from the browser locale instead of defaulting to English — a saved choice and the document's own `fo:language` still win
+- The recent-files list only offers what it can actually reopen: a document opened without a File System Access handle is no longer recorded, stale entries are pruned at startup, and a declined permission prompt keeps its entry — only a moved or deleted file drops it
+- The ODT exporter and both importers load on first use (main chunk 2.1 MB → 1.37 MB, gzip 615 → 411 KB), and the word count runs once per changed document instead of on every caret move
+- The spell-check word lists travel as `.txt`: a `.dic` is served as `text/x-c` and uncompressed, where `text/plain` goes out gzipped — the English list costs 191 KB over the wire instead of 552 KB, and the measured first load drops 1.83 → 1.70 MB
+- Ribbon polish: a big button's label wraps to at most two lines and hugs its width, icons share one row, group labels are a size smaller, a split button's arrow is bigger where the menu is the point, Paste is one button that opens its menu, and the Shape Format group lines up with its menu in the top layer
+- A picture pasted from a web page is fetched into the document instead of showing from its URL, and both importers read a `javascript:` link as text
+
+### Fixed
+
+**Word compatibility**
+- Two structural defects made Word declare "unreadable content" and rebuild the document with its own defaults: the style XML of a table or list style was wrapped in an element only Word rejects, and the page-background pass wrote a second `w:displayBackgroundShape` — the repair then dropped every header and footer reference. Both exports are now validated against the ECMA-376 and ODF 1.3 schemas in CI, which also corrected the declared ODF version, `w:settings` child order, `draw:image` xlink attributes and the `text:time-value` datatype
+- Document defaults and the Title/Heading 1–6 inheritance chain survive the export again: EdenText's own styles replaced the docx package's whole factory set (`w:docDefaults` included) and defined the heading styles twice, so headings rendered serif, regular and mis-sized while the body fell back to Word's own default font
+- Fields resolve on open: the TOC, index and bibliography carry their cached result (Word for Mac never updates fields), an index entry is written as a complex `XE` field, `STYLEREF` travels as an outline level rather than a quoted style name — which errors in every non-English Word — and a cell-format picture uses the document language's separators
+- Headers, footers and page decor stay put: `w:titlePg` is written only on the section that begins a header set (Word blanks the first page of any other), and the watermark and fold marks ride the first-page and even-page variants in both formats
+- A section break that only switches the header and footer no longer opens a page in `.docx`: a `w:sectPr` without `w:type` means `nextPage`, a break neither the editor nor the ODT export makes
+- A styled table keeps its style's lines: table-level borders are no longer written, and a suppressed cell border exports as `w:val="nil"`, the only spelling that wins Word's border-conflict rules
+- Reading Word's own files: a bibliography no longer imports twice (Word caches the field's rows as a table inside it), an index takes the file's `toc 1`–`toc 9` styles instead of the editor's fallback indent, a text box keeps the height it declares (`noAutofit`), and the running head keeps the chapter name its `STYLEREF` field cached
+- A document keeps its look across the formats: header rows as `w:tblHeader`, an index's leader and tab stop, a box's own inset and its placement across the column, a later section naming its zones even when blank (an unnamed one is Word's Link to Previous), SVG rasterized on the way out, and a document holding no note keeps its note configuration
+
+**LibreOffice compatibility**
+- A page border no longer narrows every line and stretched the document by a page: ODF lays border and padding inside the margin, so the export carves them out of `fo:margin-*` and the import grows them back
+- Plain text boxes export as Writer text frames instead of drawing objects, keeping their lists, nested images and borders; a floating anchor's paragraph offset is floored at one twip, below which LibreOffice's wrap layout paints a neighbouring box outside its shape
+- Footnotes and endnotes open with LibreOffice's own hanging pair and a tab after the marker, and the note prefix/suffix stays in the note area instead of doubling on the anchor
+- Right-to-left paragraphs carry the `style:writing-mode` + `fo:text-align="end"` pair LibreOffice writes itself, and the DOCX import no longer reads a base direction's own edge as an alignment
+- Package hygiene: the `Comment` pool style is defined rather than only referenced, and a section with no page setup of its own writes no dangling master-page reference
+- The header/footer band is measured instead of counted in lines — max(declared height, content + gap), a dynamic gap absorbed as the zone grows, the space below its last paragraph left out, a zone of empty paragraphs as tall as they are, its tab stops aligned per line — so the body opens where LibreOffice opens it. One 16-page fixture went 183 → 5 reports
+- A manual page break keeps the block's space above (only an automatic break swallows it), the page geometry is elected before the body is read so table widths and image fits measure against the right text width, and an imported page margin is what the file declares rather than capped at 10 cm
+- Mirrored documents: a left page keeps the header its master gives every page, two masters naming each other are read as a mirrored pair rather than a title page, a single right-page layout mirrors nothing, and a section's header sits on the section's own margins
+- A frame placed by coordinate floats on the side that has room, a table aligned to the margins fills the text width, contextual spacing reaches across a list's nesting, a list number wider than its hanging indent pushes the text instead of printing over it, and a text box in a header/footer keeps its lines
+- A page set in Arial fell back to the browser's serif on a machine without Liberation Sans installed: the bundled TTFs are declared under their own family too
+
+**The round trip**
+- A section survives both formats whole: its master laid out from its own zones, its page setup, text width and next style, a line spacing given as a percentage, styles carrying shading and borders, odd/even and the page-number format document-wide, footnote numbering in the section properties, and style names encoded as NCNames
+- A section opening on a side hands its one-page master to a follow-up master instead of asking for a right-only page, which doubled the page count; DOCX names its default style Normal and marks it as the default, and the importer opens no phantom section on the leading master
+- Page decor reaches the opening page: an empty first master was swallowed by the next one's match, so the watermark and the fold marks missed the first section, and every master of a section now writes its running zone — blank where its own page has none — which also gave an opening page back 0.8 cm of its margin
+- A list item goes out whole: an `.odt` kept only its first paragraph, and the item's page break, a heading nested in it and the own formatting of its later blocks now survive; a header row the table did not ask to repeat came back as ordinary cells, and only DOCX wrote it
+- Notes keep what they hold: an endnote's picture pointed at a relationship the package never minted, both note parts now carry a formula and its ruby, and a field's cached run keeps the marks around it instead of going out bare
+- Both importers compared whether a run underlines, not how, so a red or wavy line under a plainly underlining style came back plain
+- The editor holds no shape either file would drop: a page break lives on a body block or a list item only, a note anchor keeps no marks and stays out of a text box, sub- and superscript exclude each other, and a table's first row is all header cells or none
+
+**Page layout**
+- Line numbering counts what both word processors count: visual lines, list items and column paragraphs, one line per display formula or frame band, and the measurements are unscaled by the zoom factor — at any zoom but 100 % every number used to drift
+- Sub- and superscript render at 58 % out of the line box, as EdenText's exporters already write them, so a raised run no longer grows its line by ~4 px and pages break where LibreOffice breaks them
+- A multi-column section balances again (the paragraph mark stayed absolutely positioned, which made Chromium stack every block into column 1), a block after a top/bottom-wrapped frame clears its band, and the rows a merged cell spans stay on one page
+- A floating text box lands inside its column at first paint instead of after the next click, and the chapter field is resolved per zone the way LibreOffice does — the header shows the chapter in force at the page top, the footer the last one begun on the page
+- Every column of a multi-column section begins at the same height: the space below a block rides as padding beside its margin, which an engine keeps at a column break where it truncates a margin
+
+**Editing and the interface**
+- A heading's style name no longer lands on the plain paragraph Enter opens after it, and heading levels 2–6 reach the style command at all (a digit class built from the maximum level read as `[0-1]`, so the shortcut set a level with no style)
+- The page count survives switching the pane layout, the toolbar state survives the focus change that comes with it, and zooming the multi-page grid keeps the reader's place instead of snapping to the first row
+- Enter at the very first position of a leading table opens a paragraph above it, so the caret can get before a document that starts with a table; the formula/sort/split dialog flips below a table it would otherwise cover
+- Shape Format follows the caret rather than only a node selection, so the tab no longer vanishes the moment you click into a box, and it carries the vertical-text control
+- Saving where the File System Access API is unavailable keeps its download alive past the click, explains the browser's ask-where-to-save setting once, and reports the real error when a save or export fails; a full localStorage no longer fails the save itself
+- The document's format and its password survive a reload and a declined replace, a failed save falls back to Save As only for a lost file handle, the autosave flushes when the page is hidden, and the empty document's placeholder follows the UI language
+- PDF/print export no longer aborts while a placeholder field is selected
+- Tab stops survive replacing the document: the measuring pass kept a key of the layout it last drew and skipped the redraw when the new document measured the same, so opening two files — or the two DIN 5008 letter forms in a row — left every tab on the default grid and the second document's columns collapsed
+- The ruler stays over the page beside the margin balloons: it was sized from the page alone and centred over the wider box that reserves the balloon strip, so a document with comments hung its ruler to the right of the page it measures
+
+### Distribution
+- The build ships the notices its dependencies require: `licenses.txt` quotes all 97 bundled packages, the font licenses travel with the fonts, and the About dialog links both and names the commit the hosted app was built from
+- The PWA install icon is re-rendered from the current logo, with a padded maskable variant for Android's mask; the service-worker cache bump drops the stale icons from existing installs
+- Discoverability: meta description, Open Graph tags with a 1200 × 630 preview card, a canonical URL, a static intro paragraph for crawlers and noscript browsers, `robots.txt` and a `sitemap.xml`
+- The README carries the release's features and a first-load size measured over the wire, a light/dark hero picture and a gallery: `scripts/showcase/run.mjs` builds three sample documents plus a review variant as `.odt` and `.docx` through the app's own exporters in headless Chromium, opens each one back through the file dialog and shoots it in the ribbon tab its feature lives in
+
+### Testing
+- The document corpus grew to fifteen documents — the newest with numbered chapters and heading styles of its own — and gained a third author: beside the `docx`-lib original and its LibreOffice ODT twin, each document is now committed as Word re-saved it (rsids, `proofErr`, separator notes, theme defaults), asserted to read the same and to survive the round trip
+- New legs for what a symmetric round trip is blind to: semantic package lint (unique ids, dangling style/numbering/relationship references, manifest completeness), the styles LibreOffice actually resolves out of an export, a pixel comparison of the same document rendered from both formats, the cross-format leg comparing every attribute under the file's own stylesheet, the exporters' arguments beyond the tree (notes, page decoration, line numbering, zones, properties) read back from a file, and LibreOffice opening what we encrypt and vice versa
+- Two browser runs (`npm run test:smoke`, `npm run test:dom`) boot the built app in Chromium, Firefox and WebKit and hold the page count against a settle, a reload, a zoom, a page break and its undo, plus the unsaved state; CI runs all three engines
+- The parity harness aligns two documents' line streams instead of stopping at the first divergence, keeps the blank pages LibreOffice inserts in its reference, caches reference PDFs by file hash, and reads the case a style paints
+- The fuzz generator covers named list styles, and the status bar's text statistics are unit-tested
+- The fuzz leg draws the export options too — styles, outline numbering, sections with their zones, margins, paper and page numbering, decor, line numbering, notes and metadata — compares the effective values per section, names what a format has no place for, and validates every seed as ODT and DOCX against the schemas (`FUZZ_SEEDS`, `SCHEMA_SEEDS` widen the sweep)
+- Three further browser runs: LibreOffice re-reads every fuzz seed in both formats, `npm run test:layout` opens the corpus, the showcase and the seeds against LibreOffice's page count, lints the lines for overlap, margin escapes and stranded headings and holds a recorded baseline of where each page starts, and `npm run test:monkey` types at random in the body and both zones under the schema, undo to the start, redo and both saved formats reading back
+- Eleven picture fixtures carried a PNG whose IDAT came from another image — a failing CRC and a truncated stream that Chromium and WebKit render anyway and Firefox reports as corrupt
+
+### Design notes
+- The bundled fonts and the exported font names are **metric twin pairs**: EdenText renders the free Liberation faces, the saved file declares the Microsoft counterpart each was designed to replace glyph-width for glyph-width — Liberation Serif ↔ Times New Roman (body), Liberation Sans ↔ Arial (headings), Liberation Mono ↔ Courier New (Source Text) — and import maps the names back. Every Word installation renders the file with identical line breaks and no substitution surprises, no fonts need embedding, and LibreOffice performs the same pairing itself on systems without the Microsoft faces
+
+## [0.1.0] — 2026-08-17
+
+First public release, deployed on GitHub Pages.
+
+### Stack
+- Vite + Svelte 5 (runes mode) + TypeScript
+- TipTap 3 / ProseMirror (individual extensions, no starter-kit)
+- odf-kit for ODT generation, `fflate` for (un)zipping `.odt`/`.docx`
+- `docx` for Word (.docx) export/import
+- `jspdf` + `html2canvas` for PDF export
+- Hunspell (`hunspell-asm`, WASM) with `dictionary-en` / `dictionary-de` for spell check
+- Vitest (+ jsdom) for testing; `svelte-check` for type-checking
+- No backend — fully client-side
+
+### Implemented
+
+**Architecture**
+- WYSIWYG editor built on TipTap 3 (individual extensions, no starter-kit); toolbar active-states stay reactive via a `tick` counter (Svelte 5 same-reference workaround)
+- Fixed A4 paper canvas (794 × 1123 px @ 96 dpi) with CSS-simulated pagination and visual page breaks
+- LocalStorage auto-save (debounced 1 s); restores document, theme, zoom, margins, orientation, etc. on reload
+- Fully client-side / serverless; hand-coded SVG favicon
+- A committed corpus of ten documents (`tests/corpus/`) CI runs against: each is authored with the `docx` lib directly — never with our own exporter, which would test it against itself — and converted to its ODT twin by LibreOffice. `corpus.test.ts` asserts that both formats of a document read the same, and that each survives our export and import in either format
+- Placeholder text on an empty document
+
+**Text formatting**
+- Bold, Italic, Underline, Strikethrough
+- Subscript / Superscript
+- Font family picker (lists only fonts installed on the machine; remembers recently used fonts)
+- Font size
+- Font color and highlight color (color picker with custom colors)
+- Headings H1–H10 with LibreOffice's sizes (18/16/14/13/12/12 pt, levels 4 and 6 italic), including un-bolding a heading. Levels 7–10 continue level 6 at 12pt — probed, LibreOffice writes those styles with no properties of their own and resolves them from its style pool, so there is no file value to follow. HTML stops at `h6`, so they render as unknown elements the editor's CSS makes blocks
+
+**Styles**
+- Named paragraph styles with LibreOffice's inheritance model: a style has a parent, a follow-on style and its own properties; changing a style updates every paragraph using it. Built-ins Default text → Heading → Heading 1–6 / Title / Subtitle / Quote, with LibreOffice's values (18/16/14/13/12/12 pt headings)
+- Named character styles (Emphasis / Strong Emphasis / Source Text + own ones) as a mark on a text run
+- Style gallery in the toolbar lists both families; assigning a style keeps hard formatting (Word/LibreOffice behavior), Ctrl+M clears direct formatting but keeps the style
+- Style manager ("Manage styles…"): inheritance tree, live property editing (empty field = inherit again), new / update from selection, rename, delete, reset a built-in — for paragraph and character styles alike
+- Round-trips as real styles, not baked formatting: ODF `style:style` (`style:family="paragraph"`/`"text"`, `style:parent-style-name`, `style:next-style-name`) and DOCX `w:pStyle`/`w:rStyle` with `w:basedOn`/`w:next`; import adopts the file's used styles plus their parent chains, so only formatting beyond the style stays direct
+- Named table styles as the third family (Word's table styles / LibreOffice's AutoFormats): 14 built-ins — Grid (+ rows / columns only), List shaded / columns, Plain, four colored box lists, Grid & List Accent, Academic, Financial. Picking one from the gallery in the table toolbar paints header row, banded rows/columns, first/last column and total row, and a styled table re-bands itself when rows or columns are added
+- Word's Table Style Options as six checkboxes beside the gallery (header row, total row, first/last column, banded rows/columns): an area is painted only when the style defines it *and* the table opts in, and turning the header row off shifts the banding by one row. The toolbar's header row / first column buttons drive the same flags, so both surfaces always agree
+- Table styles are edited in the same style manager (third tab: area picker for fill and font, outer / row line / column line controls, new / rename / remove), also reachable from the insert-table dropdown
+- Round-trip: the style name travels as an ODF `style:family="table"` (`style:parent-style-name`) and DOCX `w:tblStyle`, the options as ODF's `table:use-*-styles` and Word's `w:tblLook`. Fills and borders are materialized into the cells and the region's font is baked onto the runs, so the table looks right in Word/LibreOffice even though ODF has no banding concept — the style definitions themselves live in the app, as LibreOffice's AutoFormats do
+- Banded rows and columns start on the **first** body row/column, as in Word and LibreOffice — the stripe used to begin one row late. A document with a table style assigned re-bands itself when it is next opened
+- A paragraph style's own rule line and colored field are read from the style, not only from direct formatting, so a Word Title keeps the line under it — with the gap the file asks for (`w:pBdr w:space` / ODF `fo:padding`), on the ruled sides only
+- A Word table's indent follows the file's compatibility mode: up to Word 2010 `w:tblInd` is measured to the cell's text, so the table hangs its left cell margin into the page margin and the first column's text lines up with the body — from Word 2013 it is the table's edge
+- A Word file's own table style is read the other way round: its conditional areas (`w:tblStylePr` — header row, banded rows, first/last column) are baked into the cells on import, shading, borders and bold/colour alike, so a document styled with Word's Light Grid or Medium Shading opens looking like it does in Word and LibreOffice
+- A new document starts from the built-in styles, like Word's/LibreOffice's default template
+
+**Paragraphs & lists**
+- Text alignment: left, center, right, justify
+- Line spacing and paragraph spacing (space before / after)
+- Increase / decrease indent (paragraphs and lists)
+- Bulleted and ordered lists — nested, with multiple numbering styles (decimal, alpha, roman; `.` or `)` suffix) and whole-list indent; Tab / Shift-Tab to nest / un-nest
+- Word-style nesting defaults for ordered lists: an indented level numbers 1. → a. → i. (repeating) instead of restarting at "1." everywhere; explicit styles per level still override. Plus legal/outline numbering (1., 1.1., 1.2.1. …) as a list type — rendered via CSS counters, round-trips to ODF `text:display-levels` and DOCX `%1.%2.` lvlText chains
+- Nested ordered levels advance the cycle relative to the level above and inherit its suffix (a level-1 `a)` gives `i)` then `1)`); the numbering style chosen for a level is reused when you nest into it again
+- Customizable bullet symbols per list level (picker on the bullet-list split button: • ◦ ▪ ❖ ➢ ⇨ ✓ – >); round-trips to ODF `text:bullet-char` and DOCX `w:lvlText`, and the DOCX/ODT import maps Wingdings/Symbol bullets (arrows, diamonds, checkmarks …) to their Unicode equivalents instead of flattening them to plain dots. Symbols Liberation Serif lacks render from a bundled 2 KB DejaVu Sans subset (`EdenSymbols.woff2`), so markers look compact and identical on every platform instead of a stretched OS fallback
+- Tab stops per paragraph: left, centre, right and decimal, honoured in the rendered text (CSS only has a fixed tab grid, so each tab is measured and placed); a hanging indent implies a stop at the text position. Set them on the ruler; round-trips to ODF `style:tab-stops` and DOCX `w:tabs`
+- Paragraph borders and shading: per-side borders with presets (all / single edges / none), width and color, plus a background fill, on paragraphs and headings; typing `---`, `___` or `===` on a line of its own turns it into a rule line (Word/LibreOffice AutoCorrect). Round-trips to ODF `fo:border-*`/`fo:background-color` and DOCX `w:pBdr`/`w:shd`
+- AutoCorrect while typing (LibreOffice's Tools ▸ AutoCorrect Options, one checkbox per rule): typographic quotes per document language (`"…"` / `„…“`), its dash matrix (`A - B` → `A – B`, `A--B` → `A—B`), its replacement table (`-->` → `→`, `(C)` → `©`, `...` → `…`), capitalize the first letter of a sentence — with an abbreviation exception list — and TWo INitial CApitals. URL recognition and auto-list ride the same switches
+- Word completion (the same dialog's own section, as LibreOffice keeps it): every word of at least eight letters is remembered as it is typed, and typing its first three letters offers the rest in grey after the caret — Enter takes the offer, Esc drops it. It is offered while typing only, so an Enter meant to split a paragraph never completes a word instead, and the offer stays outside the document until it is accepted. Minimum length, an appended space and clearing the collected words are all settable
+- AutoText (LibreOffice's Tools ▸ AutoText, Word's Insert ▸ Quick Parts): keep a selected block of text under a name and a shortcut, then insert it from the library or by typing the shortcut and pressing F3 — LibreOffice's own key. An entry keeps its formatting, and the library belongs to the app rather than to a document, as it does in both products
+- Ruby annotations (Insert ▸ Phonetic guide — LibreOffice's Format ▸ Asian Phonetic Guide, Word's Phonetic Guide): the reading printed over its base text, the selected text proposed as the base. Round-trips as ODF `text:ruby` with its ruby-family style and as Word's `w:ruby` run — verified through LibreOffice both ways, including our `.docx` converted to `.odt` by it
+- A text box can run its text top-to-bottom (its toolbar's ⇊ button — LibreOffice's Format ▸ Text Attributes ▸ Text direction, Word's Text Direction): the browser lays the vertical flow out itself. Round-trips as the frame style's own writing mode in ODF — its *paragraph* properties, probed: in the graphic properties LibreOffice drops it — and as Word's `w:bodyPr vert`, with the VML fallback's `layout-flow:vertical` read too. Both verified through a LibreOffice re-save; converting our `.docx` to `.odt` LibreOffice itself loses the direction
+- Automatic hyphenation for the whole document (Layout ▸ Hyphenation): the browser hyphenates in the document's own language, which shortens a justified paragraph the way LibreOffice does. Round-trips as ODF `fo:hyphenate` on the base style — where LibreOffice keeps it, in its *text* properties — and Word's `w:autoHyphenation`
+- Manual line breaks (Shift+Enter)
+
+**Insert**
+- Tables: insert via size picker, Word-style row/column drag-resize, add / delete rows & columns, delete table, cell borders, merge cells and split cells (N×M, Word/LibreOffice-style), cell background shading, header row / first column toggles, named table styles (see Styles); a table splits cleanly across page boundaries
+- Repeat the header row: the first row is drawn again at the top of every page the table continues on, as in Word and LibreOffice. Round-trips to ODF `table:table-header-rows` and Word's `w:tblHeader`. A row that fits a page never splits anyway (the editor paginates a table between its rows), so Word's "don't allow row to break" needs nothing
+- Sort a table's rows (LibreOffice's Table ▸ Sort, Word's Layout ▸ Sort): the three keys both dialogs offer, each by any column, ascending or descending and with its own sort type — automatic (a cell that reads as a number sorts numerically, anything else by the document language's collation), numerically, or alphanumerically, which is the plain collation that puts "10" before "2". A later key decides only where the ones before it tie, rows alike in every key keep the order they were typed in, and the first row can be kept in place as a header
+- A formula cell's own number format (in the Formula dialog, as Word has it): the general format, whole numbers, two decimals, grouped thousands, the two percentages, the document language's currency and its short date. ODF keeps it on the cell's style as a data style LibreOffice regenerates the value from, Word on the field as its `\#` switch — LibreOffice's own DOCX filter neither reads nor writes that switch, so the format survives the ODF leg and our own DOCX round trip
+- The currency symbol and the date's order come from the document's language, not from a table of locales: LibreOffice renders our file exactly as the editor does (`$1,234.00` / `3/15/23` in English, `1.234,00 €` / `15.03.23` in German). A date is a serial day count from LibreOffice's own day 0, 1899-12-30. Word's formula dialog offers no date format, so the DOCX leg carries it in the field's `\@` date picture for us to read back
+- Formulas in a cell (LibreOffice's Table ▸ Formula, Word's Layout ▸ Formula): `=SUM(ABOVE)`, `=AVERAGE(A1:A3)`, `=A1*2` — SUM, PRODUCT, AVERAGE, MIN, MAX, COUNT, ABS, INT, SIGN, MOD and ROUND over cell references, ranges and Word's directions, with arithmetic and parentheses. A formula cell shows its result on the field shade both word processors use and recomputes as the cells it reads change, a formula reading another formula included. It rides the cell as ODF's `table:formula` in LibreOffice's own language (`ooow:sum <A1:A3>`, a direction resolved to the range it stands for) with the result cached as `office:value`, and as Word's `=` field inside the cell — both re-read
+- Number recognition (LibreOffice's Table ▸ Number Recognition): with it on, a cell whose text reads as a number is rewritten in the document language's number format when the cursor leaves it — `007,50` becomes `7,5`. **Off** by default, as it is in LibreOffice, and the parsing a formula does is independent of it, exactly as there
+- Table border control (Word/LibreOffice-style): per-side cell borders with presets (all / outside / inside / single edges / none), line width and color; buttons show active states matching the current pen and toggle borders off; round-trips to ODF `fo:border-*` and DOCX `w:tcBorders`
+- Lines and arrows (shape gallery: line, arrow, double arrow), which both importers used to drop: two endpoints rather than a box, so they hold no text, run across the frame's diagonal and take an arrow head that scales with the pen. The three kinds share their preset names on purpose — the heads a file declares are what tell them apart, so a Word `straightConnector1` with no heads opens as a plain line. ODF gets its own `<draw:line>` plus the one named `Arrow` marker LibreOffice itself writes; Word gets the `line` preset with `flipV` and `a:headEnd`/`a:tailEnd`. Verified against LibreOffice: the same three lines render identically from the .odt, the .docx and the editor
+- Images: inline or floating with text wrap (left / right / top-bottom), resize handles, rotation, live size badge; insert via toolbar, drag-and-drop, or paste. A floating frame is placed by the file's own offsets, and two top-and-bottom frames set against opposite ends of the text share one band, side by side
+- A CMYK JPEG's embedded ICC profile is dropped on import: Chromium colour-manages through it where LibreOffice and Word convert naively, which turned a contract's logo from vivid blue to dull teal and its black to grey. It also removes what is often most of the file (a 757 KB logo → 102 KB, easing the localStorage ceiling below)
+- EMF metafiles are drawn (`import/emf.ts`): the picture is rebuilt as SVG from the metafile's own records — paths, filled shapes, text with its font and colour, embedded bitmaps — so a plot pasted out of MATLAB or Excel arrives as a picture instead of a placeholder
+- Anything wider than the sheet — an oversized formula, a frame reaching past the margin — is cut at the page edge, as it is in LibreOffice
+- Charts are drawn from the file — DrawingML `chartN.xml` and ODF `chart:chart`, bar / line / area / scatter / pie, with their titles, axis titles, gridlines, axis bounds and series colours (read-only; see the limitations below)
+- Special characters picker
+- Date and time fields: picker with 7 date and 4 time formats (live samples) and an "update automatically" toggle — fixed fields keep the inserted moment, auto fields refresh on open. Round-trips to ODF `text:date`/`text:time` (minted `number:date/time-style`) and DOCX `DATE`/`TIME` fields; the field carries the surrounding font
+- Page numbering options (Layout ▸ Page numbers): the five formats both word processors offer (1 / i / I / a / A) and a start value. Round-trips to ODF `style:num-format` on the page layout plus `style:page-number` on the first paragraph — where LibreOffice keeps the start, ODF having no document-level one — and to Word's `w:pgNumType`
+- Table of contents: generated from headings (H1–H5) with live page numbers and dot leaders, click an entry to jump to its heading; round-trips to ODF `text:table-of-content` and a Word TOC field. An index the file writes **without** page numbers (Word's `TOC \n`, an ODF entry template naming no `<text:index-entry-page-number/>`) keeps its rows text-only, leader and all
+- Alphabetical index (References ▸ Index entry, then the Index in the same menu): mark a word — under a key of its own where the index should file it elsewhere — and the index lists every term once, sorted case-insensitively, with all the pages it was marked on. Round-trips as ODF `text:alphabetical-index-mark` + `text:alphabetical-index` (LibreOffice reads both back unchanged) and as Word's `XE` and `INDEX` fields
+- Bibliography (References ▸ Citation, then the Bibliography in the index menu): a citation carries its whole source record — short name, type and its fields — so the document needs no database beside it, and the list prints one row per source cited, in document order and without page numbers, as both word processors do. Round-trips as ODF `text:bibliography-mark` + `text:bibliography` (LibreOffice reads every field back and regenerates the list from our entry templates) and as Word's `CITATION` and `BIBLIOGRAPHY` fields over a `b:Sources` custom-XML part — which LibreOffice's own Word export drops, so the record survives our leg and not its
+- Section page setup: a section carries its own paper (Layout ▸ Orientation ▸ This section), so a wide table gets its landscape page amid portrait ones. The editor lays it out — the page grid is a table of per-page boxes rather than one repeating cycle, and every page below a section moves with it — and it round-trips as an ODF page layout of its own per master page and a `w:pgSz` per `w:sectPr`
+- Comments: annotate a selection (Review tab or the context menu) and work through them in the reviewing pane — edit, resolve, remove, click one to jump to the text it marks. Round-trips to ODF `office:annotation`/`office:annotation-end` (with LibreOffice's `loext:resolved`) and to Word's `w:commentRangeStart`/`-End` + `word/comments.xml`; a LibreOffice point comment, which has no range, attaches to the run before it
+- Track changes (Review ▸ Record changes): while recording, typed text is marked as an insertion and deleted text stays in the document struck through instead of going away, each carrying its author and date; consecutive typing is one change, and accept / reject work on the change at the cursor or on all of them. Round-trips to ODF's `text:tracked-changes` registry — `text:change-start`/`-end` around an insertion, `text:change` where a deletion was, its text kept in the registry — and to Word's `w:ins`/`w:del` + `w:delText`
+- Footnotes and endnotes (Ctrl+Alt+F / Ctrl+Alt+D): a footnote is drawn at the foot of the page its anchor sits on, with the separator line above it and the body text moved up to make room; endnotes are collected on their own page at the document end. Notes renumber themselves as anchors move, and deleting an anchor deletes its note. An options dialog covers numbering format, start value, restart, position, prefix/suffix, the two styles and the separator's length, thickness, spacing, alignment and colour. Round-trips to ODF `text:note` + `text:notes-configuration` and to Word's `word/footnotes.xml`/`endnotes.xml` + `w:footnotePr`
+- Formulas: dialog with a LaTeX field and live preview; only the LaTeX is stored, the MathML the browser typesets, the ODF formula object and the OMML are derived from it. Inline or as a centered display line, double-click to edit. Round-trips as a real embedded ODF formula object (`draw:object` + `Formula{n}/content.xml`, our LaTeX kept in the MathML `annotation`) and as Word's `m:oMath`. STIX Two Math is bundled, so stretched brackets and ∑/∫ look the same on every platform
+- Hyperlinks: create / edit / remove (toolbar + Ctrl+K), Ctrl/Cmd+click to open, hover hint showing the URL; ODF `text:a` round-trip
+- Bookmarks and cross-references: name a selection, then insert a reference to it (its text, its number or its page); the reference follows the text it points at. Round-trips to ODF `text:bookmark-start`/`text:bookmark-ref` and Word's `Bookmark` + `REF`/`PAGEREF` fields
+- Manual page break (Ctrl+Enter); round-trips to ODF `fo:break-before`
+- Text boxes and basic shapes — rectangle, rounded rectangle, ellipse, triangles, diamond, pentagon, hexagon, five-point star, trapezoid, parallelogram and the four block arrows: editable block content, fill and border colors, border width, resize/rotate handles, text wrap (inline / left / right / top-bottom) like images; a shape gallery in the floating toolbar and in the ribbon's Shape tab. Each outline is one polygon in `utils/shapes.ts` that the editor draws as SVG and the ODF export scales into its `draw:enhanced-path`, so the shape on screen is the shape in the file; Word gets the preset's name and draws its own. Round-trips to ODF `draw:frame`/`draw:text-box` + `draw:custom-shape` and DOCX DrawingML `wps:wsp`/`wps:txbx` (imports Word's `mc:AlternateContent` and legacy VML text boxes too)
+- A drawing no gallery covers — a freeform, a polygon, a polyline, a bezier curve, a connector's elbow — keeps its own outline instead of being dropped: the box holds the file's path in the same 0…100 box a preset's points use, and the editor draws it. Read from all four dialects the two products write (ODF `draw:points`, `svg:d` on a `draw:path` or `draw:connector`, a `non-primitive` enhanced-path, DrawingML `a:custGeom` and VML's own reversed-case `path`), written back as ODF's enhanced-path and Word's custGeom — LibreOffice renders both exactly as the editor draws them. An outline that never closes is stroked only, as a polyline is in both products
+- A text box carries its content into Word intact: a list inside one is a real Word list with its own numbering definition (nesting, marker symbols and start values included) and a picture inside one is a real picture, its bytes and relationship minted beside the package's own. Both were flattened to literal `•`/`1.` markers and dropped, respectively
+
+**Page & layout**
+- Page margins (cm) and page orientation (portrait / landscape)
+- Page format picker (Layout panel): 15 Word/LibreOffice sizes — A3–A6, ISO B4–B6, JIS B4/B5, Letter, Legal, Tabloid, Executive, Folio, Statement — each showing its cm dimensions; drives the on-screen page, pagination, and ODT/DOCX/PDF export, and is detected & adopted on import
+- Right-to-left pages (ODF `style:writing-mode="rl-tb"`, Word's `w:bidi`): the body's base direction, so a multi-column page fills its columns **from the right** as LibreOffice does, and bidi resolves a Hebrew or Arabic line the way the file means it. Round-trips through both formats
+- Per-paragraph text direction (Paragraph dialog ▸ Text direction, where LibreOffice keeps it): a single quoted Hebrew or Arabic paragraph turns right-to-left inside a left-to-right document — and back. Round-trips as the block's own `style:writing-mode` / `w:bidi`, in table cells and list items too; the direction the page already has is inheritance, not formatting, so neither importer stamps it on every block
+- Mirrored page margins (ODF `style:page-usage="mirrored"`, Word's `w:mirrorMargins`): the declared left/right are the inner/outer pair, and an even (left-hand) page swaps them — body text and the header/footer band alike. Switched on where the margins are set (the ribbon's Margins menu and the Layout panel), which renames the two fields Inner/Outer; a margin preset changes the values, not whether the setup is a book. Round-trips through both formats
+- Multi-column (newspaper) layout: 1–3 columns with adjustable gap, applied to the whole document (no selection) or to selected paragraphs, Word-style — text fills column 1 to the page bottom, then column 2, and flows across pages with mid-paragraph line breaks; a section followed by other content balances its columns. Round-trips to ODF `text:section`/`style:columns` and DOCX continuous sections with `w:cols`
+- A section that opens on a **right or left page** (ODF `style:page-usage`, Word's odd/even-page section break, in the ribbon's Breaks menu): a blank page goes in where the flow would open it on the other side, which is how a book starts every chapter recto. Read, rendered and written back in both formats
+- Page margins per section: a section's own `w:pgMar` / ODF page layout is read, rendered and written back, and an ODF page style that hands over to another (`style:next-style-name`, the title-page idiom) gives its layout to the section's first page and the successor's to the rest. The ruler and the header/footer layer still show the document's own pair
+- Headers & footers: page-number / page-count fields, configurable edge distances, and variants — different first page and different odd & even pages (edit a page's zone directly; blank first/even zones supported). Press Enter to add blank lines that grow a zone into the page while body text reflows so the page break sits above the footer / below the header, never overlapping. Inline images/logos can be inserted in a zone. Round-trips to ODF (`style:header-first`/`-left`, `draw:frame`) and DOCX (`w:titlePg`/`w:evenAndOddHeaders`, `ImageRun`)
+- Zoom (20–300 %)
+- A section's own page setup: paper size and orientation per section (Layout ▸ Size / Orientation ▸ This section), beside the document's own. Pages of different sizes are each **centred** in the scroll, as both word processors draw them — sheet, text, header/footer, page border and line numbers alike
+- Horizontal ruler above the page: click to place a tab stop of the selected type, drag to move it, drag it off to remove it; three markers set the paragraph's first-line, left and right indent. Toggle in the extended toolbar
+- Show formatting marks (spaces, tabs, paragraph marks)
+
+**Editing aids**
+- Word/LibreOffice keyboard shortcuts throughout: Ctrl+L/E/R/J alignment, Ctrl+Alt+1–5 headings and Ctrl+Shift+N default style, Ctrl+1/2/5 line spacing, Ctrl+Shift+P / Ctrl+Shift+B super/subscript, Ctrl+Shift+. / Ctrl+Shift+, grow/shrink font, Ctrl+Space clear formatting, Ctrl+Shift+Space non-breaking space, Ctrl+Shift+- soft hyphen, Alt+Shift+D / Alt+Shift+T date & time field, Ctrl+O open, F3 / Shift+F3 find next/previous, Ctrl+F10 formatting marks — alongside the existing Ctrl+B/I/U, Ctrl+M, Ctrl+K, Ctrl+Enter, Ctrl+F/H, Ctrl+S/P and Tab/Shift+Tab. All bindings live in one table, so tooltips stay in sync and they can be remapped later
+- Undo / Redo with a labelled history dropdown
+- A paragraph of its own can opt out of the document's automatic hyphenation (Format ▸ Paragraph ▸ Text Flow, as LibreOffice has it). Only "off" travels — Word cannot turn hyphenation *on* for one paragraph — and only under a document that hyphenates: below that switch it says what is already true. Round-trips as ODF `fo:hyphenate="false"` in the paragraph's **text** properties and Word's `w:suppressAutoHyphens`
+- Search & Replace (Ctrl+F / Ctrl+H): live match highlighting, match count, next / previous, match-case and whole-word options, replace current / replace all
+  A `.*` toggle searches by regular expression, and the replacement expands `$1`…`$9` / `$&` from the match's captures (LibreOffice's syntax; Word has no equivalent)
+  A `¶` toggle searches and replaces **formatting**, as LibreOffice's Format… and its Paragraph Styles box do: bold / italic / underline, font, size and colour, plus a paragraph style — on the search side and on the replacement side. A format narrows a text search to the runs carrying it, and with the search field empty the formatting is the search — every such run, or every paragraph in that style. A replacement with no text only reformats, so a whole document can be restyled without retyping it, and a heading style switches the block over as the style gallery does
+- Right-click context menu for text: cut / copy / paste / paste without formatting, link insert-edit-remove, clear formatting — with the spelling suggestions merged in on top. Shift+right-click keeps the browser's own menu; images, text boxes and header/footer stay with their existing UI
+- Spell check in English and German with squiggles and suggestions in the context menu (add / ignore word); selectable document language. Powered by Hunspell (WASM), so German compound words (Fußgänger, Krankenversicherung …) are recognised; dictionaries are lazy-loaded per language on demand
+- Word / character count statistics (whole document and selection)
+- Reviewing pane for tracked changes (Review ▸ Revisions), beside the comments one: every recorded change in document order — author, date, what was inserted or deleted — click to select the text, accept or reject in place. A change a paragraph boundary splits is one row and is applied whole. Each **author** draws in their own colour (LibreOffice's author palette, handed out in order of first appearance), so several reviewers stay apart on the page. Recording is the **document's** setting, not the editor's: it is read from the file, written back into it, and a new document starts with it off — an opened document is never marked up as the reader's own work
+- Navigator pane (F5, or View ▸ Navigator): the document's chapters as an outline, click one to jump to it and the caret's own chapter stays marked. Beside each, LibreOffice's four chapter operations — move up / down and promote / demote a level, each carrying everything under the heading with it. A move swaps with the adjacent chapter at the same level and never crosses a heading above it, so a subheading stays in its own chapter. Below the outline, the tables, pictures and bookmarks LibreOffice's Navigator also lists, as jump targets
+- Split view (View ▸ Split, Word's own Ctrl+Alt+S): two panes onto the same document, scrolled independently and both editable — read one page while writing on another, or copy between distant parts. The panes are stacked, as both word processors split a window, so they share a width and the second renders the pagination the first measures rather than laying the document out twice. The divider drags; whichever pane you last worked in keeps the caret, the floating toolbars and the ribbon's commands, and the other one stays where you left it
+- Several pages side by side (View ▸ Multiple Pages, up to four): the page grid both reference products show a document in — rows filled left to right, scrolling as one canvas, every page editable. Neither of them stops at two (LibreOffice takes a column count, Word fits as many as the window allows), and both re-zoom for the view, so a whole row is fitted when the count changes. Each cell is a live view of its own, so a very long document is heavier here than in a single column
+
+**UI & theming**
+- Light / Dark / AllBlack / Auto appearance modes (settings menu in toolbar)
+- Two switchable chromes: the tabbed ribbon (default — File/Home/Insert/… tabs plus contextual table/picture/shape tabs, collapsible band), and the "Modern" floating toolbar with an expandable extended row (horizontal scroll on narrow windows)
+- Status bar with page number, word count, language and zoom controls
+- About dialog
+- UI internationalization (English / German): language picker, auto-detects the browser
+  language on first load, persisted; covers toolbar, dialogs, menus, status bar and warnings
+
+**File & export**
+- ODT export via odf-kit with extensive content.xml / styles.xml post-processing (custom node types, tables with borders, images, fonts and colors); filename derived from the first heading (fallback `document.odt`)
+- ODT import / open existing file: parses content.xml / styles.xml directly, adopts the file's margins and orientation, and reports graceful-degradation warnings
+- Opens `.ott` templates (OpenDocument Text Template): read like an `.odt`, but as a new untitled document — the first Save writes a fresh `.odt` and never overwrites the template (Word/LibreOffice behavior)
+- Saves as a template too (File ▸ Save ▸ Template): the picker offers `.ott` and `.dotx`, and the chosen extension decides which exporter runs. A template is the document with one label changed — the ODF package's media type, Word's content type for the document part — so both word processors open it as an untitled copy
+- Recent files in the File menu, as both word processors have: opening or saving a document puts it at the top of the list, and a click reopens the file itself where the browser can hand its handle back (the File System Access API re-asks for permission after a reload). A file that has moved or been declined is reported and dropped from the list rather than left to fail again; a browser without the API keeps the names only
+- Pictures are autosaved to IndexedDB, not localStorage: the document JSON keeps a short key per picture, so an image-heavy document no longer runs into the ~5 MB quota that used to stop it saving. Each save sweeps the pictures the document has dropped, a picture used twice is stored once, and where IndexedDB is unavailable everything stays inline as before
+- Embedded font loading: fonts embedded in an opened `.odt`/`.docx` (Word `.odttf` de-obfuscated) are registered via the FontFace API so text renders in its real face even when the font isn't installed; persisted per-document in IndexedDB so it survives a reload. Fonts the document only names but neither embeds nor installs are still flagged as substituted
+- Citation styles for the bibliography (References ▸ Citation style): LibreOffice's cite-by-short-name, numbered (`[1]`, counting in citation order), APA, MLA and Chicago. The style sets both what a citation shows in the text and how each row of the list reads, and every citation restyles itself as the document is edited. It round-trips where both word processors keep it: as the ODF entry template LibreOffice regenerates its rows from — so the same rows come back out of LibreOffice — and as Word's `b:Sources StyleName`. The shapes are each style's common form, not a full CSL implementation
+- List of figures and list of tables (References ▸ Table of contents ▸ the two caption indexes): the same generated index the table of contents is, over the captions of one category instead of the headings — single-level, with live page numbers and leader dots. Round-trips as ODF `text:illustration-index` / `text:table-index` (found by the counter's name, as LibreOffice finds them) and Word's `TOC \c "Figure"` field
+- Page numbering restarts per section (Layout ▸ Page number format ▸ This section): the front matter counts i, ii, iii and the body starts at 1 again. Round-trips as ODF `style:page-number` on the paragraph that switches master page and Word's `w:pgNumType w:start` — a section that restarts is exported as a page-starting break, since both word processors ignore a start on a continuous one
+- Line numbering (Layout ▸ Line numbers, LibreOffice's Tools ▸ Line Numbering): numbers in the left margin, continuous or restarting each page, every nth line, with or without empty lines. Measured off the rendered lines, so the preview and the saved file agree; round-trips as ODF `text:linenumbering-configuration` and Word's `w:lnNumType`
+- Page design (Layout ▸ Page design): a page background colour, a border around the text area at a settable distance from it, and a text watermark with its own colour, angle and transparency — LibreOffice's Format ▸ Page Style ▸ Area/Borders and its Format ▸ Watermark. All three round-trip: ODF keeps them on the page layout and the master page's header, Word on `w:document` / `w:sectPr` / a VML shape in the header part
+- Captions (References ▸ Caption, LibreOffice's Insert ▸ Caption): a caption paragraph in the `Caption` style with a running number that counts itself — one counter per category (figure / table), in document order, renumbering as the document is edited. Round-trips as an ODF `<text:sequence>` (with LibreOffice's own `ooow:Illustration+1` formula) and a Word `SEQ Figure \* ARABIC` field
+- Synonyms (Ctrl+F7, Review ▸ Synonyms, the context menu) — a thesaurus, labelled for what it does rather than by its name in both products: the word at the caret, the sense groups it appears in, click one to replace it — and a box to look up any other word. The synonyms are LibreOffice's own, its MyThes data re-packed to one group per line (`scripts/make-thesaurus.mjs`, de 3.0 MB / 37k groups, en 6.7 MB / 143k). It loads on first use for the document's language and is scanned, not indexed: ~4 ms per lookup against the ~100 MB an index would cost
+- Word (.docx) export and import — round-trips the editor's formatting (text, fonts, lists, tables, images, headers/footers, page geometry) and opens real Word documents
+- Document properties (title, subject, author, keywords, comments) in the File menu — LibreOffice's File ▸ Properties / Word's File ▸ Info. Round-trips through ODF `meta.xml` (one `meta:keyword` per keyword) and DOCX `docProps/core.xml`
+- File handlers: the installed app registers for `.odt` / `.ott` / `.docx` / `.dotx`, so the OS offers it for a double-clicked document and hands the file over through `launchQueue` — with its handle, so the first Save writes that same file. Word templates (`.dotx`) open like `.ott` does: read for their content, never bound as the file to save over
+- Installable and offline (`public/manifest.webmanifest`, `public/sw.js`): nothing here talks to a server at runtime, so once the app's files are cached it is the whole working editor with the network gone — spell checker, fonts and all. The service worker reads the build's own hashed asset names out of the entry document, which precaches the shell with no build step; what the app loads lazily (a dictionary, the speller's WASM) is kept as it is asked for, so it joins from the second visit on. The document itself is network-first, or a cached one would keep naming the assets of the build it was cached with. Verified in a headless Chromium with the network cut: the app reloads, styles and all, and the manifest validates clean
+- PDF export — Raster (pixel-exact copy of the editor with a selectable text layer) and Vector (crisp, fonts embedded, via the browser print dialog)
+- Print (printer button / Ctrl+P) — opens the browser print dialog with a pixel-exact raster of the document (tables, headers/footers and page breaks intact)
+
+### Not yet implemented
+
+The gap against Word/LibreOffice, most valuable first. Reviewed 2026-09-13.
+
+**Content an imported document loses**
+- Charts are **drawn** from the file (`import/chart.ts`: DrawingML `chartN.xml` and ODF `chart:chart`), but as a picture, not a chart object — a re-export carries the drawing and the numbers behind it are no longer editable. The same holds for an **EMF** metafile (`import/emf.ts`): it is drawn, but as the SVG picture it was rebuilt into, and only from the record set a plot consists of — a hatched brush, a clipping region or a rotated bitmap is skipped. **WMF/SVM** metafiles and OLE objects still keep their box and a placeholder label, and export writes that back out: WMF is a different (16-bit) record format, SVM is StarOffice-proprietary, and an OLE object cannot be rendered without its application
+- A **text box in the header/footer** keeps its text but not its box: the zone is a one-paragraph document, so no block node fits in it and the box's paragraphs become lines of the zone ahead of the one that anchors it. Lists and tables flatten to text; floating DOCX drawings are removed, while inline images remain. A positioned box therefore reads in the zone's own flow rather than at its corner. An ODF **shape group** (`draw:g`) still drops with the "Drawings were removed" warning; DOCX drawing groups open as their individual frames
+- A table of contents is **regenerated** on load, never read from the field's cached rows — so an index whose producer left headings out of its cache comes back listing every heading in the document. Reading the rows instead is the opposite of a live index; what the file says *about* the rows (depth, leader, tab stop, entry styles, page numbers) is read
+- **Nested tables** flatten to paragraphs on import and cannot be authored. A section has at most three columns; tables and text boxes inside a multi-column section move outside that section on import
+- A drawing tool: a freeform, a polygon or a connector **imports, draws and saves** (see below), but there is no way to author one here. A Word connector preset (`bentConnector3`) is also still dropped — Word resolves that geometry and writes no path for it
+
+**Unavailable when authoring**
+- Hyphenation's zone and ladder count (`fo:hyphenation-ladder-count`, `w:hyphenationZone`) — CSS exposes neither
+- A formula reaching into another table — LibreOffice's `<Table1.A1>` has no counterpart in Word's field language, so it could not survive the DOCX leg. A cell's number format is offered as the closed set both dialogs list, so a foreign document's own currency symbol or date order is re-spelled in the document's language rather than kept
+- A list level's own hanging indent: the marker sits at the 0.635 cm both exports write (`LIST_HANGING_CM`), so a wider *left*-set marker overflows where Word moves the text to the next list tab (a **right**-set one — `w:lvlJc`, which is what the built-in Roman numberings use — grows into the margin and is fine). Reading the value back naively also moves the markers of our own ODT exports — LibreOffice draws its own flat hanging at exactly the value odf-kit writes for level 2; see `tests/render-parity/README.md` before building on it
+- Linked / chained text frames: text overflowing one frame continues in the next, which is a layout engine's job — CSS Regions would do it and no engine implements them
+- Multi-document management: each browser tab keeps its own document, but there is no in-app window list, document tabs or side-by-side compare
+- A vertical writing mode for the **page** (ODF `tb-rl` on the page layout): a text box can run its text top-to-bottom, the body cannot — pagination fills a page downwards. A ruby annotation's own alignment and position are not offered either; both products' defaults are what we write
+- A chapter number whose label is **wider than its own tab stop**: it is set in the character style the file names, hung out of the level's indent and given that stop as its minimum width, but where the label overruns the stop LibreOffice advances to the paragraph's next tab stop (its own, else the 1.25cm grid) and CSS cannot round a box to a grid — so the title sits up to one step early. A caption still numbers from the document rather than restarting per chapter (ODF `text:sequence` on an outline level)
+- Digital signatures
+
+**Out of scope for now**
+- Mail merge, data sources, form fields
+- Master documents
+- Real-time collaboration (there is no backend by design)
+- Macros / scripting
+
+### Known limitations
+
+Deviations from Word/LibreOffice the browser does not let us remove. Anything
+merely unimplemented belongs in the list above, not here.
+
+- A chapter number and a list marker are drawn by `::before`, so they are not
+  part of the text and no text walk sees them — the render-parity harness reads
+  a numbered heading as if it were unnumbered. Root cause: CSS gives `::marker`
+  no position, and both products set the label at the level's own hanging
+  indent, so the marker has to be a generated box rather than a real one; a
+  ProseMirror widget would put it in the document, where every caret, selection
+  and export pass would have to step over it. The contents rows carry the label
+  as real text (`outlineLabel`), which is the part that can be checked.
+  `getComputedStyle(el, '::before').content` returns the *specified* value
+  (`counter(edt-outline-1, decimal) ". "`), never the resolved number, so the
+  harness cannot synthesize the word from the page either.
+  Noted 2026-09-02, revised 2026-09-03.
+
+- Zoom 100% does not visually match Word/LibreOffice at 100% on the same
+  screen. Root cause: the editor uses the browser's fixed 96 CSS DPI
+  (794×1123 px for A4 — see `editor.css`, `pageBreaks.ts`), while Word and
+  LibreOffice render against the OS-reported physical screen DPI so that
+  1 cm on paper ≈ 1 cm on screen. Possible future fix: add a user-side
+  calibration (DPI value or visual ruler) that scales the `zoom` factor.
+  Decided 2026-05-26 not worth the effort for now.
+- An image or text box cannot be dropped at a free point on the page **and have
+  text wrap around it**. Root cause: `float` is the only way to make browser
+  text wrap around a box, and CSS Exclusions, which would wrap around a freely
+  placed one, are unimplemented in every engine. A frame the text is *meant* to
+  run through — Word's in-front-of / behind-text, ODF run-through — is placed
+  absolutely and keeps its own offsets; it just cannot push text aside.
+  A file's own offsets are drawn: both round-trip (`wrapOffset`/`wrapOffsetY` =
+  `svg:x`/`svg:y`, `positionH`/`positionV`) and both place the frame, the vertical
+  one for top-and-bottom wrap, where no text sits beside it. What stays out of
+  reach is a frame a word processor puts *inside* running text: Chromium moves
+  every line after a full-width float below it, so such a frame lands after the
+  paragraph's text instead. Noted 2026-08-08, revised 2026-08-09.
+- A line takes one word more or fewer than LibreOffice, for two reasons neither
+  of which CSS exposes. LibreOffice **compresses** inter-word spaces to fit a
+  line (measured on a fixture: 91 of 349 full-width justified lines, up to
+  0.83 px per space at 12 pt) where CSS justification only expands; and it
+  quantizes every glyph advance where Chromium keeps it fractional, so the two
+  drift apart along the line (identical word widths, 0.45 mm apart by the
+  150th mm). A matching negative `word-spacing` was tried and reverted — it
+  fixes the break but shortens every last line; see
+  `tests/render-parity/README.md`. A third case is a run with no break
+  opportunity in it that is longer than the space left (a row of leader dots, a
+  long URL): LibreOffice fills the line and breaks the run at the margin, where
+  Chromium moves the whole run to the next line. `overflow-wrap: anywhere` would
+  match it but also breaks runs LibreOffice keeps whole and shrinks a table
+  column to its narrowest glyph. Noted 2026-08-09, revised 2026-08-11.
+- A line **inside a table cell** has slightly less room than in Word/LibreOffice,
+  so it may take one word fewer. Root cause: with `border-collapse` Chromium
+  takes the collapsed border's whole pixel off the cell's *content* width, while
+  a word processor lays the line out between the cell margins whatever the
+  border is — measured at 80.64 px of text in a 95.77 px column against
+  LibreOffice's 21.59 mm. Giving the pixel back through the horizontal padding
+  was tried and reverted: it fixes the line it was measured on and breaks
+  another two tables on, so the real offset is under 0.2 mm — the same engine
+  rounding as above. See `tests/render-parity/README.md`. Noted 2026-08-13.
+- A block ending within about half a millimetre of the page's bottom may fall on
+  the other side of the break from LibreOffice, which moves every line of the
+  page after it. Root cause: the fit test at a page boundary is a step function
+  on our block chain, and that chain is not identical to LibreOffice's — each
+  block agrees to well under the millimetre the harness tolerates, but the sum
+  decides a whole page. Measured on a fixture: an empty paragraph whose flow box
+  ends **0.62 mm** past the content end is pushed over, where LibreOffice keeps
+  it, and the heading behind it then draws its space-before in full — 14.8 mm on
+  every line of that page. A tolerance on the fit test was tried and reverted
+  (corpus 1074 → 1085): the error carries no sign, so the slack that fixes one
+  fixture keeps two lines another one's reference pushes. See
+  `tests/render-parity/README.md`. Noted 2026-08-17.
+- The **first line of a page** sits slightly lower than LibreOffice's. Root cause:
+  a font carries two ascents, and the two engines pick different ones to place
+  the first baseline against the text-area top — LibreOffice the OS/2 typo
+  ascent, Chromium the hhea one its line box is built from. Read out of the
+  bundled TTFs that is 0.7500 against 0.9521 em for Carlito (Liberation Serif
+  0.6934 against 0.8911): **1.85 mm at 26 pt**, 0.84 mm at 12 pt. Every line
+  after it matches — the line pitch is the same 1.2207 em on both sides — so it
+  is visible only on a page opening with a large heading. CSS exposes no way to
+  choose the other ascent. Noted 2026-08-13.
+- Line height follows the paragraph, not the line: the block's CSS strut applies
+  to every line, where a word processor takes each line's own runs. A paragraph
+  whose runs all agree takes theirs, so only a paragraph of *mixed* sizes struts
+  too low. A fix (`line-height: 0` + inline decoration) measured right on a
+  purpose-built fixture but cost the contract fixture 22 issues; reverted. Detail
+  in `tests/render-parity/README.md`. Noted 2026-08-08.
+- A plain text box's height is a *minimum* (content grows the box, like the
+  editor). LibreOffice recomputes auto-grow heights on open, so a re-saved box
+  keeps its content but sheds excess empty height. Shapes (rect/ellipse) export
+  with fixed geometry instead. Noted 2026-07-03.
+- A list marker does not size the line it labels. Word and LibreOffice put the
+  numbering's own font on that line, so a marker whose font reaches deeper than
+  the text grows it (measured: a Courier New bullet on 11 pt Carlito text adds
+  0.031 em ≈ 0.12 mm, which is ~1 mm down a page of bullets). Root cause: the
+  marker is an out-of-flow `::before` (`editor.css`) because CSS gives an
+  outside `::marker` no position; and an outside `::marker` has no metric
+  influence either — probed, changing its `font-family` moves nothing, only its
+  `font-size` does, and that grows the line *above* the baseline where a word
+  processor grows it below. Noted 2026-08-11.
+- **Deliberate, not a defect:** an inline formula is typeset here, not placed as
+  a box. LibreOffice stores each one as an OLE frame and positions that frame
+  (`style:vertical-pos="middle"`/`"from-top"`); we render MathML, whose own
+  baseline is the typographically right one, so the frame's vertical placement is
+  ignored on import. Honouring it was tried and measured worse — every inline
+  formula in the Math Guide sank ~1 mm and the corpus went from 100 to 125
+  reported differences. It also means a render-parity run cannot compare a
+  formula-heavy page: the two sides typeset the glyphs independently.
+  Noted 2026-08-11.
+- A paragraph a style hides (`text:display="none"`) is dropped on import, but a
+  hidden **heading** still renders where LibreOffice draws nothing. Root cause:
+  the editor has no block it can hold without drawing one, and that heading is
+  the outline the running head's `text:chapter` field reads — a chapter marker
+  exists for nothing else. Dropping it was tried and reverted: the running head
+  went blank on every page quoting it, which is a whole line wrong on each
+  against one line wrong once. A real fix needs a hidden-block attr that
+  pagination and `collectChapterStarts` (`Editor.svelte`) both understand.
+  Noted 2026-08-12.
+- **Deliberate, not a defect:** a table of contents shows live page numbers.
+  LibreOffice and Word print the numbers cached in the file until the reader
+  updates the index, so a document whose cache is stale disagrees with us (the
+  deputy-standards fixture caches page 7 for a heading that is on page 8 in both
+  renderings). Noted 2026-08-11.

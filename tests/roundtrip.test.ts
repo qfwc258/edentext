@@ -1,0 +1,3042 @@
+// Round-trip verification: editor JSON -> buildOdt() -> importOdt() -> compare,
+// plus a hand-crafted LibreOffice/Word-style .odt exercising the style resolver.
+// jsdom (vitest `environment`) supplies the global DOMParser.
+import { describe, it, expect } from 'vitest';
+import { zipSync, strToU8, unzipSync, strFromU8 } from 'fflate';
+import { getSchema } from '@tiptap/core';
+import { Node as PMNode } from '@tiptap/pm/model';
+import { buildOdt } from '../src/lib/export/odt';
+import { MAX_HEADING_LEVEL } from '../src/lib/styles/headings';
+import { importOdt } from '../src/lib/import/odt';
+import { normalize, firstDiff } from './normalize';
+import { hfExtensions } from '../src/lib/editor/extensions/headerFooter';
+import { HEADER_SHADE } from '../src/lib/editor/extensions/tableHeaderRow';
+import { builtinStyleSheet } from '../src/lib/styles/styleSheet';
+import { buildDocx } from '../src/lib/export/docx';
+import { importDocx } from '../src/lib/import/docx';
+import { EMPTY_HF_SET } from '../src/lib/storage/headerFooter';
+import { DEFAULT_NOTE_SETTINGS } from '../src/lib/storage/noteSettings';
+import { DEFAULT_PAGE_NUMBERING } from '../src/lib/storage/pageNumbering';
+import { EMPTY_PAGE_DECOR } from '../src/lib/storage/pageDecor';
+import { DEFAULT_LINE_NUMBERING } from '../src/lib/storage/lineNumbering';
+import { EMPTY_DOC_PROPERTIES } from '../src/lib/storage/docProperties';
+import { FOLD_MARK_NAME } from '../src/lib/storage/foldMarks';
+
+type N = any;
+
+// `expect.soft` so every assertion in a leg reports rather than bailing on the first.
+function check(label: string, cond: boolean, detail?: unknown) {
+  expect.soft(cond, detail !== undefined ? `${label} — ${JSON.stringify(detail)}` : label).toBe(true);
+}
+
+// ---------- helpers to build editor-shaped JSON ----------
+const T = (text: string, ...marks: N[]): N => ({ type: 'text', text, ...(marks.length ? { marks } : {}) });
+const P = (attrs: N | null, ...content: N[]): N => ({ type: 'paragraph', ...(attrs ? { attrs } : {}), ...(content.length ? { content } : {}) });
+const H = (attrs: N, ...content: N[]): N => ({ type: 'heading', attrs, ...(content.length ? { content } : {}) });
+const LI = (...content: N[]): N => ({ type: 'listItem', content });
+const CELL = (colwidth: number[] | null, ...content: N[]): N =>
+  ({ type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth }, content });
+const CELLM = (colspan: number, rowspan: number, colwidth: number[] | null, text: string, bg?: string): N =>
+  ({ type: 'tableCell', attrs: { colspan, rowspan, colwidth, ...(bg ? { backgroundColor: bg } : {}) }, content: [P(null, T(text))] });
+const ROW = (...cells: N[]): N => ({ type: 'tableRow', content: cells });
+
+// A tiny valid PNG; only its bytes matter for the round-trip (no image decoding).
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNwaDgAAAKEAYEml6crAAAAAElFTkSuQmCC';
+const IMGN = (width: number, height: number, alt?: string, rotation?: number, wrap?: string, wrapOffsetY?: number): N =>
+  ({ type: 'image', attrs: {
+    src: PNG, width, height,
+    ...(alt ? { alt } : {}), ...(rotation ? { rotation } : {}), ...(wrap ? { wrap } : {}),
+    ...(wrapOffsetY ? { wrapOffsetY } : {}),
+  } });
+const TBX = (attrs: N, ...content: N[]): N => ({ type: 'textBox', attrs, content });
+// A box is inline, so it rides a paragraph; most fixtures give it one of its own.
+const PBX = (attrs: N, ...content: N[]): N => P(null, TBX(attrs, ...content));
+// Every text box in a document, at whatever depth.
+const boxesIn = (n: N, out: N[] = []): N[] => {
+  if (n?.type === 'textBox') out.push(n);
+  for (const c of n?.content ?? []) boxesIn(c, out);
+  return out;
+};
+const COLS = (attrs: N, ...content: N[]): N => ({ type: 'columns', attrs, content });
+
+const margins = { top: 3, bottom: 2, left: 2.5, right: 1.5 };
+
+const fixture: N = {
+  type: 'doc',
+  content: [
+    H({ level: 1, textAlign: 'center' }, T('Invoice Report 2026')),
+    P({ fontSize: '22pt' }),                       // empty sized line (bare)
+    P({ fontSize: '18pt', textAlign: 'center' }),  // empty sized line + centered
+    P(null,
+      T('Plain '),
+      T('bold', { type: 'bold' }),
+      T(' italic', { type: 'italic' }),
+      T(' under', { type: 'underline' }),
+      T(' struck', { type: 'strike' }),
+      T(' sup', { type: 'superscript' }),
+      T(' sub', { type: 'subscript' }),
+    ),
+    // Character effects: letter case, line shapes, a freely raised run.
+    P(null,
+      T('caps ', { type: 'textStyle', attrs: { caps: 'uppercase' } }),
+      T('petite ', { type: 'textStyle', attrs: { caps: 'smallCaps' } }),
+      T('dotted ', { type: 'underline', attrs: { lineStyle: 'dotted', lineColor: '#FF0000' } }),
+      T('twice ', { type: 'underline', attrs: { lineStyle: 'double' } }),
+      T('crossed ', { type: 'strike', attrs: { lineStyle: 'double' } }),
+      T('raised', { type: 'textStyle', attrs: { fontSize: '14pt', textPosition: 3 } }),
+    ),
+    P(null,
+      T('arial 14 ', { type: 'textStyle', attrs: { fontFamily: 'Arial', fontSize: '14pt' } }),
+      T('red', { type: 'textStyle', attrs: { color: '#C00000' } }),
+      T(' marked', { type: 'highlight', attrs: { color: '#FFFF00' } }),
+    ),
+    // Links: native run path, plus a bold link inside a styled (CUST_P) paragraph.
+    P(null, T('Visit '), T('our site', { type: 'link', attrs: { href: 'https://example.com/' } }), T(' today.')),
+    P({ lineHeight: '1.5' },
+      T('A '),
+      T('bold link', { type: 'bold' }, { type: 'link', attrs: { href: 'https://styled.example/' } }),
+      T(' here.'),
+    ),
+    P({ textAlign: 'justify', lineHeight: '1.5', spaceBefore: 12, spaceAfter: 18 }, T('spaced and justified paragraph')),
+    P({ indent: 2.5 }, T('indented paragraph')),
+    P(null, T('first line'), { type: 'hardBreak' }, T('second line')),
+    P(null, T('before\ttab\tafter')),
+    P(null, T('logo: '), IMGN(100, 50, 'Logo')),
+    P(null, T('rotated: '), IMGN(120, 80, 'Rotated', 30)),
+    P(null, T('wrapped left '), IMGN(90, 60, 'Float', 0, 'left', 2.5), T(' text flows beside it')),
+    P(null, T('top/bottom '), IMGN(70, 50, 'Banner', 0, 'topBottom')),
+    PBX({ width: 288, height: 96 }, P(null, T('box para one')), P(null, T('box '), T('bold', { type: 'bold' }))),
+    PBX({ width: 192, height: 80, wrap: 'right', wrapOffset: 6, wrapOffsetY: 1.5, shapeKind: 'ellipse', fillColor: '#FFEE00', strokeColor: '#FF0000', strokeWidthPt: 2.25, rotation: 30 }, P(null, T('in ellipse'))),
+    COLS({ count: 2, gapCm: 0.5 }, P(null, T('newspaper column text one')), P(null, T('newspaper column text two'))),
+    { type: 'bulletList', content: [
+      LI(P(null, T('bullet one'))),
+      LI(P(null, T('bullet two')), { type: 'orderedList', attrs: { listStyleType: 'upper-roman-paren' }, content: [
+        LI(P(null, T('nested i'))),
+        LI(P(null, T('nested ii'))),
+      ] }),
+    ] },
+    { type: 'orderedList', attrs: { listStyleType: 'lower-alpha' }, content: [
+      LI(P({ textAlign: 'center' }, T('centered item'))),
+      LI(P(null, T('plain item'))),
+    ] },
+    // Depth-default numbering: attr-less nested levels export as a./i. and re-import
+    // as null (cycle suppression).
+    { type: 'orderedList', content: [
+      LI(P(null, T('cycle one')), { type: 'orderedList', content: [
+        LI(P(null, T('cycle sub')), { type: 'orderedList', content: [
+          LI(P(null, T('cycle subsub'))),
+        ] }),
+      ] }),
+    ] },
+    // Re-anchoring: an explicit "a., b." parent makes its attr-less child default to
+    // i. (not another a., b.), and the child re-imports as null (no accreted attr).
+    { type: 'orderedList', attrs: { listStyleType: 'lower-alpha' }, content: [
+      LI(P(null, T('reanchor a')), { type: 'orderedList', content: [
+        LI(P(null, T('reanchor i'))),
+      ] }),
+    ] },
+    // Suffix inheritance: an explicit "a)" parent makes attr-less children default to
+    // i) then 1) (paren, not dot), all re-importing as null.
+    { type: 'orderedList', attrs: { listStyleType: 'lower-alpha-paren' }, content: [
+      LI(P(null, T('paren a')), { type: 'orderedList', content: [
+        LI(P(null, T('paren i')), { type: 'orderedList', content: [
+          LI(P(null, T('paren 1'))),
+        ] }),
+      ] }),
+    ] },
+    // Multilevel (1. / 1.1. / 1.1.1.): attr on the top list only; an explicit style
+    // inside the chain breaks out (NL mint) and must survive as an explicit attr.
+    { type: 'orderedList', attrs: { listStyleType: 'multilevel' }, content: [
+      LI(P(null, T('ml one')), { type: 'orderedList', content: [
+        LI(P(null, T('ml one-one')), { type: 'orderedList', content: [
+          LI(P(null, T('ml deep'))),
+        ] }),
+        LI(P(null, T('ml one-two')), { type: 'orderedList', attrs: { listStyleType: 'upper-alpha' }, content: [
+          LI(P(null, T('ml override'))),
+        ] }),
+      ] }),
+      LI(P(null, T('ml two'))),
+    ] },
+    { type: 'bulletList', attrs: { indent: 2.5 }, content: [
+      LI(P(null, T('shifted bullet a'))),
+      LI(P(null, T('shifted bullet b'))),
+    ] },
+    // Custom bullet chars: ❖ at level 1; ✓ on the DFS-first nested list (drives the
+    // L# level-2 char); a default nested sibling (must NL-mint back to ◦).
+    { type: 'bulletList', attrs: { bulletChar: '❖' }, content: [
+      LI(P(null, T('diamond one')), { type: 'bulletList', attrs: { bulletChar: '✓' }, content: [
+        LI(P(null, T('check nested'))),
+      ] }),
+      LI(P(null, T('diamond two')), { type: 'bulletList', content: [
+        LI(P(null, T('default nested'))),
+      ] }),
+    ] },
+    H({ level: 2 }, T('Un', { type: 'textStyle', attrs: { fontWeight: 'normal' } }), T('bolded')),
+    { type: 'table', content: [
+      { type: 'tableRow', attrs: { rowHeight: 60 }, content: [
+        CELL([120],
+          H({ level: 3 }, T('Cell head')),
+          P(null, T('cell para')),
+          { type: 'bulletList', attrs: { bulletChar: '➢' }, content: [
+            LI(P(null, T('cell bullet'))),
+            LI(P(null, T('with nested')), { type: 'orderedList', attrs: { listStyleType: 'decimal-paren' }, content: [
+              LI(P(null, T('cell nested 1'))),
+            ] }),
+          ] },
+        ),
+        CELL([240], P(null, IMGN(80, 40))),
+      ] },
+      { type: 'tableRow', content: [
+        CELL([120], P(null, T('A2'))),
+        CELL([240], P(null, T('B2 '), T('cell link', { type: 'link', attrs: { href: 'https://cell.example/' } }))),
+      ] },
+    ] },
+    P({ breakBefore: 'page', textAlign: 'center', lineHeight: '1.5' }, T('Forced page (styled)')),
+    P({ breakBefore: 'page' }, T('Forced page (plain)')),
+    P(null, T('The end.')),
+  ],
+};
+
+function collectColwidths(node: N, acc: number[][] = []): number[][] {
+  if (Array.isArray(node.attrs?.colwidth)) acc.push(node.attrs.colwidth);
+  for (const c of node.content ?? []) collectColwidths(c, acc);
+  return acc;
+}
+
+function collectImages(node: N, acc: N[] = []): N[] {
+  if (node.type === 'image') acc.push(node);
+  for (const c of node.content ?? []) collectImages(c, acc);
+  return acc;
+}
+
+describe('Leg 1: editor → buildOdt → importOdt', () => {
+  it('round-trips the full fixture (margins, orientation, marks, images, lists, table)', async () => {
+    const bytes = await buildOdt(fixture, margins, 'landscape');
+    const res = importOdt(bytes);
+
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    check('orientation round-trips', res.orientation === 'landscape', res.orientation);
+    const m = res.margins!;
+    check('margins round-trip', !!m && Math.abs(m.top - 3) < 0.02 && Math.abs(m.bottom - 2) < 0.02 &&
+      Math.abs(m.left - 2.5) < 0.02 && Math.abs(m.right - 1.5) < 0.02, m);
+
+    const diff = firstDiff(normalize(fixture), normalize(res.content));
+    check('document JSON round-trips', diff === null, diff);
+
+    // Empty lines keep their paragraph font size (drives the empty line's height).
+    const sized = (res.content.content ?? []).filter((n: N) => n.type === 'paragraph' && !n.content?.length && n.attrs?.fontSize);
+    check('empty sized lines round-trip', sized.length === 2, sized.map((n: N) => n.attrs.fontSize));
+    check('bare empty line keeps 22pt', sized.some((n: N) => n.attrs.fontSize === '22pt'), sized);
+
+    // Images: src bytes (data-URI) and px size must round-trip exactly (body + cell).
+    const logoPara = (res.content.content ?? []).find((n: N) => n.content?.some((c: N) => c.type === 'image'));
+    const bodyImg = logoPara?.content?.find((c: N) => c.type === 'image');
+    check('image src round-trips (data-URI bytes)', bodyImg?.attrs?.src === PNG, bodyImg?.attrs?.src?.slice(0, 40));
+    check('image size round-trips (100×50 px)', bodyImg?.attrs?.width === 100 && bodyImg?.attrs?.height === 50, bodyImg?.attrs);
+    check('image alt round-trips', bodyImg?.attrs?.alt === 'Logo', bodyImg?.attrs);
+    const cellImg = collectImages(res.content).find((i: N) => i.attrs?.width === 80);
+    check('image in table cell round-trips (80×40 px)', cellImg?.attrs?.height === 40 && cellImg?.attrs?.src === PNG, cellImg?.attrs);
+    const rotImg = collectImages(res.content).find((i: N) => i.attrs?.rotation);
+    check('image rotation round-trips (30°, 120×80)', rotImg?.attrs?.rotation === 30 && rotImg?.attrs?.width === 120 && rotImg?.attrs?.height === 80, rotImg?.attrs);
+    const wrapImg = collectImages(res.content).find((i: N) => i.attrs?.wrap === 'left');
+    check('image wrap=left round-trips', wrapImg?.attrs?.width === 90 && wrapImg?.attrs?.height === 60, wrapImg?.attrs);
+    check('image vertical anchor offset round-trips (svg:y)', wrapImg?.attrs?.wrapOffsetY === 2.5, wrapImg?.attrs);
+    const tbImg = collectImages(res.content).find((i: N) => i.attrs?.wrap === 'topBottom');
+    check('image wrap=topBottom round-trips', !!tbImg, tbImg?.attrs);
+
+    // Hyperlinks: collect every link mark's href from the imported doc (body + cell).
+    const links: string[] = [];
+    (function walkLinks(n: N) {
+      for (const m of n.marks ?? []) if (m.type === 'link' && m.attrs?.href) links.push(m.attrs.href);
+      for (const c of n.content ?? []) walkLinks(c);
+    })(res.content);
+    check('native-path link round-trips', links.includes('https://example.com/'), links);
+    check('styled-path (CUST_P) bold link round-trips', links.includes('https://styled.example/'), links);
+    check('table-cell link round-trips', links.includes('https://cell.example/'), links);
+
+    const indented = (res.content.content ?? []).find((n: N) => n.content?.[0]?.text === 'indented paragraph');
+    check('indent → fo:margin-left round-trips (2.5cm)',
+      indented?.attrs?.indent != null && Math.abs(indented.attrs.indent - 2.5) < 0.02, indented?.attrs);
+
+    const shiftedList = (res.content.content ?? []).find(
+      (n: N) => n.type === 'bulletList' && n.content?.[0]?.content?.[0]?.content?.[0]?.text === 'shifted bullet a');
+    check('whole-list indent round-trips (2.5cm)',
+      shiftedList?.attrs?.indent != null && Math.abs(shiftedList.attrs.indent - 2.5) < 0.02, shiftedList?.attrs);
+
+    const cwIn = collectColwidths(fixture);
+    const cwOut = collectColwidths(res.content);
+    check('colwidth count matches', cwIn.length === cwOut.length, { in: cwIn.length, out: cwOut.length });
+    // per-cell weights are slices of one column set: compare cell-width fractions
+    const fracIn = cwIn.flat().map((w, _, all) => w / all.reduce((a, b) => a + b, 0));
+    const fracOut = cwOut.flat().map((w, _, all) => w / all.reduce((a, b) => a + b, 0));
+    check('column ratios round-trip', fracIn.length === fracOut.length &&
+      fracIn.every((f, i) => Math.abs(f - fracOut[i]) < 0.02), { fracIn, fracOut });
+  });
+});
+
+describe('Leg 1a: page format', () => {
+  it('round-trips a non-A4 format (legal)', async () => {
+    const doc: N = { type: 'doc', content: [P(null, T('Legal page.'))] };
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, null, 'legal');
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('styles.xml emits legal page height (35.56cm)', styles.includes('35.56cm'), styles.match(/fo:page-(width|height)="[^"]*"/g));
+
+    const res = importOdt(bytes);
+    check('format round-trips as legal', res.format === 'legal', res.format);
+  });
+
+  it('detects letter format', async () => {
+    const doc: N = { type: 'doc', content: [P(null, T('US letter.'))] };
+    const res = importOdt(await buildOdt(doc, margins, 'portrait', undefined, null, 'letter'));
+    check('format round-trips as letter', res.format === 'letter', res.format);
+  });
+
+  it('round-trips a non-preset format via the styles.xml override (tabloid)', async () => {
+    const doc: N = { type: 'doc', content: [P(null, T('Tabloid page.'))] };
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, null, 'tabloid');
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('styles.xml emits tabloid width (27.94cm)', styles.includes('fo:page-width="27.94cm"'), styles.match(/fo:page-(width|height)="[^"]*"/g));
+    check('styles.xml emits tabloid height (43.18cm)', styles.includes('fo:page-height="43.18cm"'));
+    check('format round-trips as tabloid', importOdt(bytes).format === 'tabloid', importOdt(bytes).format);
+  });
+
+  it('round-trips executive (fractional cm) and landscape swap', async () => {
+    const doc: N = { type: 'doc', content: [P(null, T('Executive landscape.'))] };
+    const bytes = await buildOdt(doc, margins, 'landscape', undefined, null, 'executive');
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('landscape swaps executive width (26.67cm)', styles.includes('fo:page-width="26.67cm"'), styles.match(/fo:page-(width|height)="[^"]*"/g));
+    const res = importOdt(bytes);
+    check('format round-trips as executive', res.format === 'executive', res.format);
+    check('orientation round-trips as landscape', res.orientation === 'landscape', res.orientation);
+  });
+});
+
+describe('Leg 1a2: hardBreak font size (empty-line height)', () => {
+  it('round-trips a break run font so a blank line between two breaks keeps its size', async () => {
+    const fs36: N = { type: 'textStyle', attrs: { fontSize: '36pt' } };
+    const br = (): N => ({ type: 'hardBreak', marks: [fs36] });
+    const doc: N = { type: 'doc', content: [P(null, T('Muster', fs36), br(), br(), T('Arbeitsvertrag', fs36))] };
+    const res = importOdt(await buildOdt(doc, margins, 'portrait'));
+    const brs: N[] = [];
+    (function walk(n: N) { if (n.type === 'hardBreak') brs.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    check('both hardBreaks survive', brs.length === 2, brs.length);
+    const sized = brs.every((b) => b.marks?.some((m) => m.type === 'textStyle' && m.attrs?.fontSize === '36pt'));
+    check('both hardBreaks carry the 36pt run font', sized, JSON.stringify(brs));
+  });
+});
+
+describe('Leg 1a2b: formulas (embedded ODF formula objects)', () => {
+  it('exports an inline and a display formula and re-imports both LaTeX sources', async () => {
+    const F = (latex: string, display: boolean): N => ({ type: 'formula', attrs: { latex, display } });
+    const inline = '\\phi _{ref}=\\frac{a+1}{2\\pi }';
+    const block = '\\sum_{i=1}^{n} \\sqrt{x_{i}}';
+    const doc: N = { type: 'doc', content: [
+      P(null, T('Die Formel '), F(inline, false), T(' im Text.')),
+      P(null, F(block, true)),
+    ] };
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const files = unzipSync(bytes);
+    const content = strFromU8(files['content.xml']);
+    check('content.xml anchors both frames as-char', (content.match(/<draw:object xlink:href="\.\/Formula\d"/g) ?? []).length === 2, content.match(/<draw:frame[^>]*Formula[^>]*>/g));
+    // A sized frame makes LibreOffice scale the object to fit instead of typesetting
+    // it at its natural size.
+    check('the frames carry no svg geometry', !/<draw:frame[^>]*Formula[^>]*svg:width/.test(content), content.match(/<draw:frame[^>]*Formula[^>]*>/g));
+    // The formula object is its own ODF sub-document; without the manifest entries
+    // LibreOffice ignores it.
+    const manifest = strFromU8(files['META-INF/manifest.xml']);
+    check('manifest declares both formula objects', /Formula1\/" manifest:media-type="application\/vnd\.oasis\.opendocument\.formula"/.test(manifest) && /Formula2\/content\.xml/.test(manifest), manifest.match(/Formula\d\/[^"]*/g));
+    const obj = strFromU8(files['Formula1/content.xml']);
+    check('the object holds MathML, not just the source', /<mfrac>/.test(obj) && /<msub>/.test(obj), obj.slice(0, 200));
+
+    const res = importOdt(bytes);
+    const found: N[] = [];
+    (function walk(n: N) { if (n.type === 'formula') found.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    check('both formulas come back', found.length === 2, found.length);
+    check('inline source is unchanged', found[0]?.attrs?.latex === inline, found[0]?.attrs?.latex);
+    check('display source is unchanged', found[1]?.attrs?.latex === block, found[1]?.attrs?.latex);
+    check('the display flag survives', found[0]?.attrs?.display === false && found[1]?.attrs?.display === true, found.map((f) => f.attrs?.display));
+    check('surrounding text is untouched', JSON.stringify(res.content).includes('Die Formel '), null);
+  });
+
+  it('reads an object whose doctype names a MathML DTD, as an older office suite writes it', async () => {
+    const doc: N = { type: 'doc', content: [P(null, T('Vor '), { type: 'formula', attrs: { latex: 'a+b', display: false } }, T(' nach.'))] };
+    const files = unzipSync(await buildOdt(doc, margins, 'portrait'));
+    files['Formula1/content.xml'] = strToU8('<?xml version="1.0" encoding="UTF-8"?>'
+      + '<!DOCTYPE math:math PUBLIC "-//OpenOffice.org//DTD Modified W3C MathML 1.01//EN" "math.dtd">'
+      + '<math:math xmlns:math="http://www.w3.org/1998/Math/MathML"><math:semantics><math:mrow>'
+      + '<math:mi>x</math:mi><math:mo>+</math:mo><math:mi>y</math:mi>'
+      + '</math:mrow></math:semantics></math:math>');
+    const res = importOdt(zipSync(files));
+    const found: N[] = [];
+    (function walk(n: N) { if (n.type === 'formula') found.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    check('the document still imports', JSON.stringify(res.content).includes('Vor '), null);
+    check('the formula comes back', found.length === 1 && /x/.test(String(found[0]?.attrs?.latex)), found[0]?.attrs?.latex);
+  });
+});
+
+describe('Leg 1a2c: footnotes and endnotes', () => {
+  const REF = (id: string, kind: string, text: string): N =>
+    ({ type: 'noteRef', attrs: { id, kind, text } });
+  const notesDoc = (): N => ({ type: 'doc', content: [
+    P(null, T('Body one'), REF('a', 'footnote', '1'), T(' and on.')),
+    P(null, T('Body two'), REF('b', 'endnote', 'i'), T(' ends.')),
+    { type: 'noteSection', content: [
+      { type: 'note', attrs: { id: 'a', kind: 'footnote', label: null, text: '1' },
+        content: [T('The footnote, with '), T('bold', { type: 'bold' }), T(' inside.')] },
+      { type: 'note', attrs: { id: 'b', kind: 'endnote', label: null, text: 'i' },
+        content: [T('The endnote.')] },
+    ] },
+  ] });
+
+  it('writes text:note at the anchor and reads it back', async () => {
+    const bytes = await buildOdt(notesDoc(), margins, 'portrait');
+    const files = unzipSync(bytes);
+    const content = strFromU8(files['content.xml']);
+    check('the footnote sits inside the body paragraph', /Body one<text:note text:id="ftn1" text:note-class="footnote">/.test(content), content.match(/<text:note[^>]*>/g));
+    check('the endnote carries its own class', /text:note-class="endnote"/.test(content), content.match(/<text:note[^>]*>/g));
+    check('each note keeps its citation', /<text:note-citation>1<\/text:note-citation>/.test(content) && /<text:note-citation>i<\/text:note-citation>/.test(content), content.match(/<text:note-citation[^>]*>[^<]*</g));
+    check('the note body is a Footnote-styled paragraph', /<text:note-body><text:p text:style-name="Footnote">/.test(content), content.match(/<text:note-body>[\s\S]{0,80}/g));
+    check('run formatting inside the note survives', /The footnote, with <text:span[^>]*>bold<\/text:span>/.test(content), content.match(/The footnote[^<]*(<[^>]*>[^<]*){0,4}/g));
+    check('no hoisted note paragraph is left behind', !content.includes('\uE017'), content.match(/.\uE017./g));
+
+    const styles = strFromU8(files['styles.xml']);
+    check('both note classes are configured', /<text:notes-configuration text:note-class="footnote"/.test(styles) && /<text:notes-configuration text:note-class="endnote"/.test(styles), styles.match(/<text:notes-configuration[^>]*>/g));
+    check('footnotes are numbered document-wide, as LibreOffice does', /text:footnotes-position="page" text:start-numbering-at="document"/.test(styles), styles.match(/<text:notes-configuration text:note-class="footnote"[^>]*>/g));
+    check('endnotes keep their roman format', /text:note-class="endnote"[^>]*style:num-format="i"/.test(styles), styles.match(/<text:notes-configuration text:note-class="endnote"[^>]*>/g));
+    check('the Footnote paragraph style is written out', /<style:style style:name="Footnote" style:family="paragraph"/.test(styles), null);
+    check('the separator rides the page layout', /<style:footnote-sep [^>]*style:rel-width="25%"/.test(styles), styles.match(/<style:footnote-sep[^>]*>/g));
+
+    const res = importOdt(bytes);
+    const refs: N[] = [];
+    (function walk(n: N) { if (n.type === 'noteRef') refs.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    const section = (res.content.content ?? []).find((n: N) => n.type === 'noteSection');
+    check('both anchors come back', refs.length === 2, refs.map((r) => r.attrs));
+    check('their classes survive', refs[0]?.attrs?.kind === 'footnote' && refs[1]?.attrs?.kind === 'endnote', refs.map((r) => r.attrs?.kind));
+    check('a note section is rebuilt', (section?.content ?? []).length === 2, section?.content?.length);
+    check('each anchor points at its own note', refs[0]?.attrs?.id === section?.content?.[0]?.attrs?.id && refs[1]?.attrs?.id === section?.content?.[1]?.attrs?.id, [refs.map((r) => r.attrs?.id), section?.content?.map((n: N) => n.attrs?.id)]);
+    check('the note text comes back', JSON.stringify(section).includes('The footnote, with'), JSON.stringify(section)?.slice(0, 200));
+    check('bold inside the note survives', JSON.stringify(section).includes('"bold"'), JSON.stringify(section)?.slice(0, 300));
+    check('the body text is untouched', JSON.stringify(res.content).includes('Body one') && JSON.stringify(res.content).includes('and on.'), null);
+    check('no note-removed warning is raised', !res.warnings.some((w: string) => /[Ff]ootnote/.test(w)), res.warnings);
+  });
+
+  it('DOCX: writes word/footnotes.xml + endnotes.xml and reads them back', async () => {
+    const bytes = await buildDocx(notesDoc(), margins, 'portrait');
+    const files = unzipSync(bytes);
+    check('a footnote part is written', !!files['word/footnotes.xml'], Object.keys(files).filter((f) => /note/.test(f)));
+    check('an endnote part is written', !!files['word/endnotes.xml'], Object.keys(files).filter((f) => /note/.test(f)));
+    const doc = strFromU8(files['word/document.xml']);
+    check('the body references both', /<w:footnoteReference w:id="1"/.test(doc) && /<w:endnoteReference w:id="1"/.test(doc), doc.match(/<w:(foot|end)noteReference[^>]*>/g));
+    const fn = strFromU8(files['word/footnotes.xml']);
+    check('the note text lives in its own part', fn.includes('The footnote, with'), fn.slice(0, 400));
+
+    const res = importDocx(bytes);
+    const refs: N[] = [];
+    (function walk(n: N) { if (n.type === 'noteRef') refs.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    const section = (res.content.content ?? []).find((n: N) => n.type === 'noteSection');
+    check('DOCX: both anchors come back', refs.length === 2, refs.map((r) => r.attrs));
+    check('DOCX: their classes survive', refs.map((r) => r.attrs.kind).join(',') === 'footnote,endnote', refs.map((r) => r.attrs.kind));
+    // Word's own separator entries carry a w:type and are referenced by nothing.
+    check('DOCX: the separator notes are not imported', (section?.content ?? []).length === 2, section?.content?.map((n: N) => n.attrs));
+    check('DOCX: each anchor points at its own note', refs[0]?.attrs?.id === section?.content?.[0]?.attrs?.id, [refs.map((r) => r.attrs.id), section?.content?.map((n: N) => n.attrs.id)]);
+    check('DOCX: the note text comes back', JSON.stringify(section).includes('The footnote, with'), JSON.stringify(section)?.slice(0, 200));
+    check('DOCX: bold inside the note survives', JSON.stringify(section).includes('"bold"'), JSON.stringify(section)?.slice(0, 300));
+    check('DOCX: the body text is untouched', JSON.stringify(res.content).includes('Body one'), null);
+  });
+
+  it('round-trips changed numbering settings through both formats', async () => {
+    const custom = {
+      ...DEFAULT_NOTE_SETTINGS,
+      footnote: { ...DEFAULT_NOTE_SETTINGS.footnote, numFormat: 'A' as const, startAt: 4, restart: 'page' as const },
+      separator: { ...DEFAULT_NOTE_SETTINGS.separator, relWidthPercent: 60, weightPt: 1.5, align: 'center' as const },
+    };
+    const odt = await buildOdt(notesDoc(), margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(), 1.25, 'add', false, custom);
+    const back = importOdt(odt).notes;
+    check('ODF: format, start and restart survive',
+      back.footnote.numFormat === 'A' && back.footnote.startAt === 4 && back.footnote.restart === 'page', back.footnote);
+    check('ODF: the separator survives',
+      back.separator.relWidthPercent === 60 && Math.abs(back.separator.weightPt - 1.5) < 0.05 && back.separator.align === 'center', back.separator);
+
+    const docx = await buildDocx(notesDoc(), margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(), 1.25, 'add', false, custom);
+    const dback = importDocx(docx).notes;
+    check('DOCX: format, start and restart survive',
+      dback.footnote.numFormat === 'A' && dback.footnote.startAt === 4 && dback.footnote.restart === 'page', dback.footnote);
+  });
+});
+
+describe('Leg 1a3: continued ordered-list start value', () => {
+  it('round-trips a start > 1 (odf-kit drops it) via text:start-value', async () => {
+    const olist = (start: number | null, t: string): N => ({
+      type: 'orderedList',
+      attrs: { listStyleType: 'upper-roman', ...(start ? { start } : {}) },
+      content: [{ type: 'listItem', content: [P(null, T(t))] }],
+    });
+    const doc: N = { type: 'doc', content: [
+      olist(null, 'First'), P(null, T('gap 1')), olist(2, 'Second'), P(null, T('gap 2')), olist(3, 'Third'),
+    ] };
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('content.xml carries text:start-value 2 and 3', /start-value="2"/.test(content) && /start-value="3"/.test(content), content.match(/text:start-value="\d+"/g));
+    const round = importOdt(bytes).content;
+    const starts = (round.content ?? []).filter((n: N) => n.type === 'orderedList').map((n: N) => n.attrs?.start ?? null);
+    check('re-imported starts continue (1, 2, 3)', JSON.stringify(starts) === JSON.stringify([null, 2, 3]), starts);
+  });
+});
+
+describe('Leg 1a4: named table style', () => {
+  // The style itself lives in the app registry (ODF has no banding), so only its name
+  // travels — the look rides on the cell attrs the style painted.
+  const styled: N = {
+    type: 'doc',
+    content: [{
+      type: 'table',
+      attrs: { tableStyle: 'Simple List Shaded' },
+      content: [
+        ROW(CELLM(1, 1, null, 'Name', '#F2F2F2'), CELLM(1, 1, null, 'Menge', '#F2F2F2')),
+        ROW(CELL(null, P(null, T('Apfel'))), CELL(null, P(null, T('3')))),
+        ROW(CELLM(1, 1, null, 'Birne', '#F7F7F7'), CELLM(1, 1, null, '5', '#F7F7F7')),
+      ],
+    }],
+  };
+
+  it('round-trips the style name and the painted cells', async () => {
+    const bytes = await buildOdt(styled, margins, 'portrait', undefined, null, 'A4', builtinStyleSheet());
+    const files = unzipSync(bytes);
+    const stylesXml = strFromU8(files['styles.xml']);
+    const contentXml = strFromU8(files['content.xml']);
+    check('styles.xml defines the table style', stylesXml.includes('style:family="table"')
+      && stylesXml.includes('style:name="Simple_20_List_20_Shaded"'),
+      stylesXml.match(/<style:style[^>]*family="table"[^>]*>/g));
+    check('the table points at it', /style:name="Table1"[^>]*style:parent-style-name="Simple_20_List_20_Shaded"/.test(contentXml),
+      contentXml.match(/<style:style[^>]*style:name="Table1"[^>]*>/g));
+
+    const res = importOdt(bytes);
+    const table = res.content.content!.find((n: N) => n.type === 'table') as N;
+    check('the name comes back on the table', table?.attrs?.tableStyle === 'Simple List Shaded', table?.attrs);
+    const fills = table.content.map((r: N) => r.content[0].attrs.backgroundColor ?? null);
+    check('the painted fills survive', JSON.stringify(fills) === JSON.stringify(['#F2F2F2', null, '#F7F7F7']), fills);
+  });
+
+  it('round-trips the table style options (Word\'s tblLook)', async () => {
+    // Header row + banded rows on, everything else off.
+    const opts: N = { ...styled, content: [{ ...styled.content![0],
+      attrs: { tableStyle: 'Simple List Shaded', tableLook: 'bandedRow headerRow' } }] };
+    const bytes = await buildOdt(opts, margins, 'portrait', undefined, null, 'A4', builtinStyleSheet());
+    const contentXml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('the options ride on table:use-*-styles',
+      contentXml.includes('table:use-first-row-styles="true"')
+      && contentXml.includes('table:use-banding-rows-styles="true"')
+      && contentXml.includes('table:use-first-column-styles="false"'),
+      contentXml.match(/table:use-[a-z-]*="[a-z]*"/g));
+
+    const table = importOdt(bytes).content.content!.find((n: N) => n.type === 'table') as N;
+    check('they come back on the table', table?.attrs?.tableLook === 'bandedRow headerRow', table?.attrs);
+  });
+
+  it('keeps two styled tables apart (the pass walks table elements, not cells)', async () => {
+    const one = { ...styled.content![0], attrs: { tableStyle: 'Simple Grid', tableLook: 'headerRow' } };
+    const two = { ...styled.content![0], attrs: { tableStyle: 'Academic', tableLook: 'headerRow lastRow' } };
+    const bytes = await buildOdt({ type: 'doc', content: [one, P(null, T('between')), two] } as N,
+      margins, 'portrait', undefined, null, 'A4', builtinStyleSheet());
+    const tables = importOdt(bytes).content.content!.filter((n: N) => n.type === 'table');
+    check('both names survive',
+      tables.map((t: N) => t.attrs?.tableStyle).join('|') === 'Simple Grid|Academic',
+      tables.map((t: N) => t.attrs));
+    check('each keeps its own options',
+      tables.map((t: N) => t.attrs?.tableLook).join('|') === 'headerRow|lastRow headerRow',
+      tables.map((t: N) => t.attrs?.tableLook));
+  });
+
+  it('bakes a region font onto the runs so Word/LibreOffice match', async () => {
+    // Box List Blue writes white bold on the header row; the editor renders that from CSS.
+    const blue: N = { ...styled, content: [{ ...styled.content![0], attrs: { tableStyle: 'Box List Blue' },
+      content: [ROW(CELLM(1, 1, null, 'Kopf', '#4A7EBB'))] }] };
+    blue.content[0].content[0].content[0].attrs.region = 'headerRow';
+    const bytes = await buildOdt(blue, margins, 'portrait', undefined, null, 'A4', builtinStyleSheet());
+    const contentXml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('a bold white run style is minted', /fo:font-weight="bold"/.test(contentXml) && /fo:color="#FFFFFF"/i.test(contentXml),
+      contentXml.match(/<style:text-properties[^>]*>/g));
+  });
+});
+
+describe('Leg 1b: merged table cells (colspan/rowspan)', () => {
+  // 3×3 grid: A spans 2 cols (row 0); C spans 2 rows (col 0, rows 1–2).
+  //   row0: [A A][B]    row1: [C][D][E]    row2: [C][F][G]
+  const mergedDoc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('Merged cells:')),
+      { type: 'table', content: [
+        ROW(CELLM(2, 1, [100, 100], 'A', '#FFFF00'), CELLM(1, 1, [100], 'B')),
+        ROW(CELLM(1, 2, [100], 'C'), CELLM(1, 1, [100], 'D'), CELLM(1, 1, [100], 'E')),
+        ROW(CELLM(1, 1, [100], 'F'), CELLM(1, 1, [100], 'G')),
+      ] },
+    ],
+  };
+  mergedDoc.content![1].content![0].content![1].attrs!.verticalAlign = 'middle';
+
+  it('exports spans + covered cells and re-imports them', async () => {
+    const bytes = await buildOdt(mergedDoc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('content.xml emits number-columns-spanned=2', content.includes('table:number-columns-spanned="2"'));
+    check('content.xml emits number-rows-spanned=2', content.includes('table:number-rows-spanned="2"'));
+    check('content.xml emits a covered-table-cell', content.includes('<table:covered-table-cell'));
+    check('content.xml emits cell shading (fo:background-color)', content.includes('fo:background-color="#FFFF00"'), content.match(/fo:background-color="[^"]*"/g));
+
+    const res = importOdt(bytes);
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    const table = (res.content.content ?? []).find((n: N) => n.type === 'table');
+    const rows = table?.content ?? [];
+    check('row 0 has 2 cells', rows[0]?.content?.length === 2, rows[0]?.content?.length);
+    check('row 1 has 3 cells', rows[1]?.content?.length === 3, rows[1]?.content?.length);
+    check('row 2 has 2 cells (covered slot skipped)', rows[2]?.content?.length === 2, rows[2]?.content?.length);
+    check('A has colspan 2', rows[0]?.content?.[0]?.attrs?.colspan === 2, rows[0]?.content?.[0]?.attrs);
+    check('C has rowspan 2', rows[1]?.content?.[0]?.attrs?.rowspan === 2, rows[1]?.content?.[0]?.attrs);
+    check('A shading round-trips (#FFFF00)', rows[0]?.content?.[0]?.attrs?.backgroundColor === '#FFFF00', rows[0]?.content?.[0]?.attrs?.backgroundColor);
+    check('B has no shading', rows[0]?.content?.[1]?.attrs?.backgroundColor == null, rows[0]?.content?.[1]?.attrs?.backgroundColor);
+    check('B keeps vertical-align middle', rows[0]?.content?.[1]?.attrs?.verticalAlign === 'middle', rows[0]?.content?.[1]?.attrs?.verticalAlign);
+    check('A stays top-aligned', rows[0]?.content?.[0]?.attrs?.verticalAlign == null, rows[0]?.content?.[0]?.attrs?.verticalAlign);
+
+    const textOf = (cell: N) => cell?.content?.[0]?.content?.[0]?.text;
+    check('A text preserved', textOf(rows[0]?.content?.[0]) === 'A', textOf(rows[0]?.content?.[0]));
+    check('F at col 1 of row 2', textOf(rows[2]?.content?.[0]) === 'F', textOf(rows[2]?.content?.[0]));
+    check('G at col 2 of row 2', textOf(rows[2]?.content?.[1]) === 'G', textOf(rows[2]?.content?.[1]));
+  });
+});
+
+describe('Leg 1c: header-row cells (bold-by-default, editable)', () => {
+  // Header-shaded cells render bold via CSS; bold is editable via fontWeight:normal.
+  // Round-trip: a default-bold run carries no mark (CSS bolds), an un-bolded run keeps
+  // fontWeight:normal, and export bakes bold so Word/LibreOffice match.
+  const hcell = (...content: N[]): N =>
+    ({ type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: [100], backgroundColor: HEADER_SHADE }, content: [P(null, ...content)] });
+  const FW_NORMAL = { type: 'textStyle', attrs: { fontWeight: 'normal' } };
+
+  const doc: N = { type: 'doc', content: [
+    { type: 'table', content: [
+      ROW(hcell(T('Bold')), hcell(T('Plain', FW_NORMAL))),
+      ROW(CELLM(1, 1, [100], 'x'), CELLM(1, 1, [100], 'y')),
+    ] },
+  ] };
+
+  it('bakes header bold on export and round-trips an un-bolded run', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('export bakes bold on the default-bold header run', /fo:font-weight="bold"/.test(xml), xml.match(/fo:font-weight="[^"]*"/g));
+    check('export emits the un-bold override', /fo:font-weight="normal"/.test(xml));
+
+    const res = importOdt(bytes);
+    const table = (res.content.content ?? []).find((n: N) => n.type === 'table');
+    const row0 = table?.content?.[0]?.content ?? [];
+    const marksOf = (cell: N) => cell?.content?.[0]?.content?.[0]?.marks ?? [];
+    // Both cells keep the header fill.
+    check('header cells keep the fill', row0[0]?.attrs?.backgroundColor === HEADER_SHADE && row0[1]?.attrs?.backgroundColor === HEADER_SHADE, row0.map((c: N) => c?.attrs?.backgroundColor));
+    // Default-bold run carries no mark (CSS provides bold).
+    check('default-bold run has no bold mark', !marksOf(row0[0]).some((m: N) => m.type === 'bold'), marksOf(row0[0]));
+    // Un-bolded run keeps fontWeight:normal.
+    const fw = marksOf(row0[1]).find((m: N) => m.type === 'textStyle')?.attrs?.fontWeight;
+    check('un-bolded run keeps fontWeight:normal', fw === 'normal', marksOf(row0[1]));
+  });
+});
+
+describe('Leg 1d: table cell borders (per-side, fo:border-*)', () => {
+  const bcell = (text: string, borders: Record<string, string> = {}): N =>
+    ({ type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: [100], ...borders }, content: [P(null, T(text))] });
+
+  // A: default borders (null attrs) · B: top hidden + custom red right ·
+  // C/D: fully borderless.
+  const doc: N = { type: 'doc', content: [
+    { type: 'table', content: [
+      ROW(bcell('A'), bcell('B', { borderTop: 'none', borderRight: '2.25pt solid #FF0000' })),
+      ROW(bcell('C', { borderTop: 'none', borderRight: 'none', borderBottom: 'none', borderLeft: 'none' }),
+          bcell('D', { borderTop: 'none', borderRight: 'none', borderBottom: 'none', borderLeft: 'none' })),
+    ] },
+  ] };
+
+  it('exports fo:border-* per side and re-imports the attrs', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('export emits fo:border-top="none"', xml.includes('fo:border-top="none"'), xml.match(/fo:border-top="[^"]*"/g));
+    check('export emits the custom red right border', xml.includes('fo:border-right="2.25pt solid #FF0000"'), xml.match(/fo:border-right="[^"]*"/g));
+
+    const res = importOdt(bytes);
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    const table = (res.content.content ?? []).find((n: N) => n.type === 'table');
+    const [row0, row1] = table?.content ?? [];
+    const a = row0?.content?.[0]?.attrs ?? {};
+    const b = row0?.content?.[1]?.attrs ?? {};
+    const c = row1?.content?.[0]?.attrs ?? {};
+    check('A keeps default borders (attrs null)', a.borderTop == null && a.borderRight == null && a.borderBottom == null && a.borderLeft == null, a);
+    check('B top border stays hidden', b.borderTop === 'none', b);
+    check('B custom right border round-trips', b.borderRight === '2.25pt solid #FF0000', b);
+    check('B bottom/left stay default', b.borderBottom == null && b.borderLeft == null, b);
+    check('C is fully borderless', c.borderTop === 'none' && c.borderRight === 'none' && c.borderBottom === 'none' && c.borderLeft === 'none', c);
+  });
+});
+
+describe('Leg 1e: table margins (dragged outer edges)', () => {
+  // Text width here is 21 - 2.5 - 1.5 = 17cm, so the table is 17 - 2 - 3 = 12cm wide.
+  const doc: N = { type: 'doc', content: [
+    { type: 'table', attrs: { marginLeft: 2, marginRight: 3 }, content: [
+      ROW(CELL([200], P(null, T('A'))), CELL([100], P(null, T('B')))),
+    ] },
+  ] };
+
+  it('exports fo:margin-* + style:width and re-imports the attrs', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    const tableStyle = xml.match(/<style:style[^>]*style:family="table"[^>]*>\s*<style:table-properties[^>]*>/)?.[0] ?? '';
+    check('export emits the left margin', tableStyle.includes('fo:margin-left="2cm"'), tableStyle);
+    check('export emits the right margin', tableStyle.includes('fo:margin-right="3cm"'), tableStyle);
+    check('export emits the remaining width', tableStyle.includes('style:width="12cm"'), tableStyle);
+    // Columns keep their 2:1 ratio inside the narrowed table.
+    check('columns fill the narrowed table', xml.includes('style:column-width="8cm"') && xml.includes('style:column-width="4cm"'), xml.match(/style:column-width="[^"]*"/g));
+
+    const res = importOdt(bytes);
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    const table = (res.content.content ?? []).find((n: N) => n.type === 'table');
+    check('left margin round-trips', table?.attrs?.marginLeft === 2, table?.attrs);
+    check('right margin round-trips', table?.attrs?.marginRight === 3, table?.attrs);
+    const weights = (table?.content?.[0]?.content ?? []).map((c: N) => c.attrs?.colwidth?.[0]);
+    check('column ratio survives', weights[0] === 2 * weights[1], weights);
+  });
+
+  it('leaves a full-width table without margin attrs', async () => {
+    const plain: N = { type: 'doc', content: [
+      { type: 'table', content: [ROW(CELL([100], P(null, T('A'))), CELL([100], P(null, T('B'))))] },
+    ] };
+    const res = importOdt(await buildOdt(plain, margins, 'portrait'));
+    const table = (res.content.content ?? []).find((n: N) => n.type === 'table');
+    check('no margins on a full-width table', !table?.attrs?.marginLeft && !table?.attrs?.marginRight, table?.attrs);
+  });
+});
+
+describe('Leg 1f: page-anchored frame (cover graphic) stacking', () => {
+  // A cover page's own graphic sits in front of text (ODF style:run-through="foreground");
+  // the default — no attr — is the usual behind-text watermark case.
+  const doc: N = { type: 'doc', content: [
+    P(null, { type: 'image', attrs: { src: PNG, width: 60, height: 40, anchorPage: 1, inFront: true } }),
+  ] };
+
+  it('exports style:run-through="foreground" and re-imports inFront', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('export writes foreground run-through', xml.includes('style:run-through="foreground"'), xml.match(/style:run-through="[^"]*"/g));
+
+    const res = importOdt(bytes);
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    const img = collectImages(res.content).find((i: N) => i.attrs?.anchorPage);
+    check('page and foreground stacking round-trip', img?.attrs?.anchorPage === 1 && img?.attrs?.inFront === true, img?.attrs);
+  });
+
+  it('defaults to background (no inFront) when the file has none', async () => {
+    const behind: N = { type: 'doc', content: [
+      P(null, { type: 'image', attrs: { src: PNG, width: 60, height: 40, anchorPage: 1 } }),
+    ] };
+    const bytes = await buildOdt(behind, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('export writes background run-through', xml.includes('style:run-through="background"'), xml.match(/style:run-through="[^"]*"/g));
+    const img = collectImages(importOdt(bytes).content).find((i: N) => i.attrs?.anchorPage);
+    check('inFront stays unset', !img?.attrs?.inFront, img?.attrs);
+  });
+});
+
+describe('Leg 2: foreign (LibreOffice/Word-style) .odt → importOdt', () => {
+  it('resolves named/automatic styles, repeated cells, lists, and reports degradations', () => {
+    const stylesXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+ <office:font-face-decls>
+  <style:font-face style:name="F1" svg:font-family="'Courier New', monospace"/>
+ </office:font-face-decls>
+ <office:styles>
+  <style:default-style style:family="paragraph">
+   <style:text-properties fo:font-size="12pt" fo:font-family="Liberation Serif"/>
+  </style:default-style>
+  <style:style style:name="Standard" style:family="paragraph"/>
+  <style:style style:name="Mono" style:family="paragraph" style:parent-style-name="Standard">
+   <style:text-properties style:font-name="F1" fo:font-size="10pt"/>
+  </style:style>
+ </office:styles>
+ <office:automatic-styles>
+  <style:page-layout style:name="pm1">
+   <style:page-layout-properties fo:page-width="21.59cm" fo:page-height="27.94cm" fo:margin-top="1in" fo:margin-bottom="1in" fo:margin-left="1in" fo:margin-right="1in"/>
+  </style:page-layout>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Standard" style:page-layout-name="pm1"/>
+ </office:master-styles>
+</office:document-styles>`;
+
+    const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0">
+ <office:automatic-styles>
+  <style:style style:name="P1" style:family="paragraph" style:parent-style-name="Standard">
+   <style:paragraph-properties fo:text-align="end" fo:margin-top="0.25in" fo:line-height="200%"/>
+  </style:style>
+  <style:style style:name="T1" style:family="text"><style:text-properties fo:font-weight="700"/></style:style>
+  <style:style style:name="T2" style:family="text"><style:text-properties fo:color="#ff0000" fo:background-color="#ffff00"/></style:style>
+  <text:list-style style:name="L1">
+   <text:list-level-style-number text:level="1" style:num-format="i" style:num-suffix=")"/>
+   <text:list-level-style-bullet text:level="2" text:bullet-char="•"/>
+  </text:list-style>
+  <text:list-style style:name="L2">
+   <text:list-level-style-bullet text:level="1" text:bullet-char="&#xF0D8;">
+    <style:text-properties style:font-name="Wingdings"/>
+   </text:list-level-style-bullet>
+  </text:list-style>
+  <style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="5cm"/></style:style>
+  <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="10cm"/></style:style>
+  <style:style style:name="ro1" style:family="table-row"><style:table-row-properties style:min-row-height="2cm"/></style:style>
+ </office:automatic-styles>
+ <office:body><office:text>
+  <text:p>plain default text</text:p>
+  <text:p text:style-name="P1"><text:span text:style-name="T1">bold700</text:span> gap<text:s text:c="3"/>tab<text:tab/>end</text:p>
+  <text:p><text:span text:style-name="T2">colored</text:span><text:line-break/><text:a xlink:href="https://x.example">a link</text:a></text:p>
+  <text:p text:style-name="Mono">mono text</text:p>
+  <text:p>img:<draw:frame><draw:image xlink:href="Pictures/x.png"/></draw:frame><text:note text:note-class="footnote" text:id="ftn1"><text:note-citation>1</text:note-citation><text:note-body><text:p>note body</text:p></text:note-body></text:note></text:p>
+  <text:list text:style-name="L1">
+   <text:list-item text:start-value="3"><text:p>roman three</text:p>
+    <text:list><text:list-item><text:p>sub bullet</text:p></text:list-item></text:list>
+   </text:list-item>
+  </text:list>
+  <text:list text:style-name="L2">
+   <text:list-item><text:p>wingdings arrow</text:p></text:list-item>
+  </text:list>
+  <table:table>
+   <table:table-column table:style-name="co1"/>
+   <table:table-column table:style-name="co2" table:number-columns-repeated="2"/>
+   <table:table-header-rows>
+    <table:table-row><table:table-cell><text:p>h1</text:p></table:table-cell><table:table-cell table:number-columns-repeated="2"><text:p>hx</text:p></table:table-cell></table:table-row>
+   </table:table-header-rows>
+   <table:table-row table:style-name="ro1">
+    <table:table-cell table:number-columns-spanned="2"><text:p>spanned</text:p></table:table-cell>
+    <table:covered-table-cell/>
+    <table:table-cell><text:p>c3</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+ </office:text></office:body>
+</office:document-content>`;
+
+    // Real picture bytes so the embedded <draw:image> resolves on import.
+    const pngBytes = Uint8Array.from(atob(PNG.split(',')[1]), c => c.charCodeAt(0));
+    const foreign = zipSync({
+      mimetype: [strToU8('application/vnd.oasis.opendocument.text'), { level: 0 }],
+      'content.xml': [strToU8(contentXml), { level: 6 }],
+      'styles.xml': [strToU8(stylesXml), { level: 6 }],
+      'Pictures/x.png': [pngBytes, { level: 6 }],
+    } as any);
+
+    const f = importOdt(foreign);
+    const c = f.content.content!;
+
+    check('foreign: margins 1in → 2.54cm', Math.abs(f.margins!.top - 2.54) < 0.01, f.margins);
+    check('foreign: Letter stays portrait', f.orientation === 'portrait');
+
+    check('foreign: plain run has no marks', c[0].content![0].marks === undefined, c[0]);
+    // Omitted fo:margin-bottom → ODF's default 0, which is the editor's default too, so no attr.
+    check('foreign: omitted margin → no spaceAfter', c[0].attrs?.spaceAfter == null, c[0].attrs);
+
+    const p1 = c[1];
+    check('foreign: P1 align end → right', p1.attrs?.textAlign === 'right', p1.attrs);
+    check('foreign: P1 0.25in → spaceBefore 18', p1.attrs?.spaceBefore === 18, p1.attrs);
+    check('foreign: P1 200% → lineHeight 2', p1.attrs?.lineHeight === '2', p1.attrs);
+    check('foreign: weight 700 → bold mark', p1.content![0].marks?.some((m: N) => m.type === 'bold'), p1.content![0]);
+    check('foreign: text:s ×3 + tab expanded', p1.content!.map((n: N) => n.text).join('') === 'bold700 gap   tab\tend', p1.content);
+
+    const p2 = c[2];
+    check('foreign: lowercase color → #FF0000', p2.content![0].marks?.some((m: N) => m.type === 'textStyle' && m.attrs?.color === '#FF0000'), p2.content![0]);
+    check('foreign: highlight #FFFF00', p2.content![0].marks?.some((m: N) => m.type === 'highlight' && m.attrs?.color === '#FFFF00'), p2.content![0]);
+    check('foreign: line-break → hardBreak', p2.content!.some((n: N) => n.type === 'hardBreak'));
+    check('foreign: text:a → link mark (href preserved)',
+      p2.content!.some((n: N) => n.text === 'a link' && n.marks?.some((m: N) => m.type === 'link' && m.attrs?.href === 'https://x.example')), p2.content);
+
+    // A named style's formatting lands in the style registry, not on the block: the
+    // paragraph just references "Mono" (font-face resolved to the real family).
+    const mono = c[3];
+    check('foreign: paragraph references its named style', mono.attrs?.styleName === 'Mono', mono.attrs);
+    const monoStyle = f.styles.paragraph['Mono'];
+    check('foreign: Mono style resolves the font face', monoStyle?.text.fontFamily === 'Courier New', monoStyle);
+    check('foreign: Mono style keeps its size', monoStyle?.text.fontSizePt === 10, monoStyle);
+    check('foreign: no direct formatting on the block', !mono.content![0].marks, mono.content![0]);
+
+    check('foreign: image and footnote anchor imported, text kept',
+      c[4].content!.length === 3 && c[4].content![0].text === 'img:' &&
+      c[4].content![1].type === 'image' && c[4].content![1].attrs?.src?.startsWith('data:image/png;base64,') &&
+      c[4].content![2].type === 'noteRef', c[4]);
+
+    const list = c[5];
+    check('foreign: list → lower-roman-paren, start 3', list.type === 'orderedList' && list.attrs?.listStyleType === 'lower-roman-paren' && list.attrs?.start === 3, list.attrs);
+    check('foreign: level-2 def → nested bulletList', list.content![0].content![1]?.type === 'bulletList', list.content![0]);
+
+    const wdList = c.find((n: N) => n.type === 'bulletList' && n.content?.[0]?.content?.[0]?.content?.[0]?.text === 'wingdings arrow');
+    check('foreign: Wingdings PUA bullet-char → ➢', wdList?.attrs?.bulletChar === '➢', wdList?.attrs);
+
+    const table = c[7];
+    check('foreign: table present', table.type === 'table');
+    const [hdr, row] = table.content!;
+    check('foreign: header row → tableHeader ×3', hdr.content!.length === 3 && hdr.content!.every((cell: N) => cell.type === 'tableHeader'), hdr.content!.map((x: N) => x.type));
+    check('foreign: repeated cell expanded', hdr.content![1].content![0].content![0].text === 'hx' && hdr.content![2].content![0].content![0].text === 'hx');
+    check('foreign: colspan 2 + covered skipped', row.content!.length === 2 && row.content![0].attrs?.colspan === 2, row.content!.map((x: N) => x.attrs));
+    check('foreign: col weights 5/10/10cm', JSON.stringify(hdr.content!.map((x: N) => x.attrs.colwidth)) === JSON.stringify([[500], [1000], [1000]]), hdr.content!.map((x: N) => x.attrs.colwidth));
+    check('foreign: spanned cell colwidth [500,1000]', JSON.stringify(row.content![0].attrs?.colwidth) === JSON.stringify([500, 1000]), row.content![0].attrs);
+    check('foreign: min-row-height 2cm → 76px', row.attrs?.rowHeight === 76, row.attrs);
+
+    const notes = c.find((n: N) => n.type === 'noteSection');
+    check('foreign: the note body follows at the document end', notes?.content?.[0]?.content?.[0]?.text === 'note body', notes);
+    check('foreign: no hyperlink warning (now round-tripped)', !f.warnings.includes('Hyperlinks were converted to plain text'), f.warnings);
+    check('foreign: no note warning (now round-tripped)', !f.warnings.some((w: string) => /[Ff]ootnote/.test(w)), f.warnings);
+  });
+
+  it('resolves a drawn shape\'s fill/stroke inherited from the default graphic style', () => {
+    // LibreOffice omits draw:fill/draw:stroke on a shape that keeps the app default
+    // (solid), taking the color from the default graphic style; only "none" turns it off.
+    const stylesXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0">
+ <office:styles>
+  <style:default-style style:family="graphic">
+   <style:graphic-properties svg:stroke-color="#3465a4" draw:fill-color="#729fcf"/>
+  </style:default-style>
+ </office:styles>
+</office:document-styles>`;
+    const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0">
+ <office:automatic-styles>
+  <style:style style:name="grInherit" style:family="graphic"><style:graphic-properties draw:auto-grow-height="false"/></style:style>
+  <style:style style:name="grNone" style:family="graphic"><style:graphic-properties draw:fill="none" draw:stroke="none"/></style:style>
+ </office:automatic-styles>
+ <office:body><office:text>
+  <text:p><draw:custom-shape draw:style-name="grInherit" svg:width="4cm" svg:height="3cm"><text:p>inherit</text:p><draw:enhanced-geometry svg:viewBox="0 0 21600 21600" draw:type="ellipse"/></draw:custom-shape></text:p>
+  <text:p><draw:custom-shape draw:style-name="grNone" svg:width="4cm" svg:height="3cm"><text:p>none</text:p><draw:enhanced-geometry svg:viewBox="0 0 21600 21600" draw:type="ellipse"/></draw:custom-shape></text:p>
+ </office:text></office:body>
+</office:document-content>`;
+    const foreign = zipSync({
+      mimetype: [strToU8('application/vnd.oasis.opendocument.text'), { level: 0 }],
+      'content.xml': [strToU8(contentXml), { level: 6 }],
+      'styles.xml': [strToU8(stylesXml), { level: 6 }],
+    } as any);
+
+    const boxes: N[] = [];
+    const walk = (n: N): void => { if (n?.type === 'textBox') boxes.push(n); (n?.content || []).forEach(walk); };
+    walk(importOdt(foreign).content);
+    check('shape fill/stroke: two ellipses imported', boxes.length === 2, boxes.map((b: N) => b.attrs));
+    const [inherit, none] = boxes;
+    check('shape fill/stroke: inherited fill #729FCF', inherit.attrs.fillColor === '#729FCF', inherit.attrs);
+    check('shape fill/stroke: inherited stroke #3465A4', inherit.attrs.strokeColor === '#3465A4', inherit.attrs);
+    check('shape fill/stroke: explicit none → null fill', none.attrs.fillColor === null, none.attrs);
+    check('shape fill/stroke: explicit none → null stroke', none.attrs.strokeColor === null, none.attrs);
+  });
+
+  it('wraps the body in columns when the page layout declares them', () => {
+    const stylesXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0">
+ <office:automatic-styles>
+  <style:page-layout style:name="pm1">
+   <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" fo:margin-top="1in" fo:margin-bottom="1in" fo:margin-left="1in" fo:margin-right="1in">
+    <style:columns fo:column-count="3" fo:column-gap="0.1965in"/>
+   </style:page-layout-properties>
+  </style:page-layout>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Standard" style:page-layout-name="pm1"/>
+ </office:master-styles>
+</office:document-styles>`;
+
+    const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">
+ <office:automatic-styles>
+  <style:style style:name="S1" style:family="section">
+   <style:section-properties><style:columns fo:column-count="1" fo:column-gap="0.5in"/></style:section-properties>
+  </style:style>
+ </office:automatic-styles>
+ <office:body><office:text>
+  <text:p>first</text:p>
+  <table:table><table:table-column/><table:table-row><table:table-cell><text:p>cell</text:p></table:table-cell></table:table-row></table:table>
+  <text:p>second</text:p>
+  <text:section text:name="Sect1" text:style-name="S1"><text:p>in section</text:p></text:section>
+ </office:text></office:body>
+</office:document-content>`;
+
+    const foreign = zipSync({
+      mimetype: [strToU8('application/vnd.oasis.opendocument.text'), { level: 0 }],
+      'content.xml': [strToU8(contentXml), { level: 6 }],
+      'styles.xml': [strToU8(stylesXml), { level: 6 }],
+    } as any);
+
+    const f = importOdt(foreign);
+    const c = f.content.content!;
+
+    check('page-cols: shape columns/table/columns', c.map((n: N) => n.type).join(',') === 'columns,table,columns', c.map((n: N) => n.type));
+    check('page-cols: count 3, gap 0.1965in → 0.5cm', c[0].attrs?.count === 3 && c[0].attrs?.gapCm === 0.5, c[0].attrs);
+    check('page-cols: 1-col section content joins the run',
+      c[2].content!.map((n: N) => n.content?.[0]?.text).join(',') === 'second,in section', c[2].content);
+    check('page-cols: table move-out warned', f.warnings.some(w => w.includes('moved out of the columns')), f.warnings);
+  });
+});
+
+describe('Leg 3: header/footer → buildOdt → importOdt', () => {
+  it('round-trips header/footer content, fields, and the geometry mapping', async () => {
+    const header: N = { type: 'doc', content: [{ type: 'paragraph', attrs: { textAlign: 'right' }, content: [
+      { type: 'text', text: 'Bericht ', marks: [{ type: 'bold' }, { type: 'textStyle', attrs: { color: '#C00000' } }] },
+      { type: 'text', text: '2026' },
+      { type: 'hardBreak' },
+      { type: 'text', text: 'Zweite Zeile' },
+    ] }] };
+    const footer: N = { type: 'doc', content: [{ type: 'paragraph', attrs: { textAlign: 'center' }, content: [
+      { type: 'text', text: 'Seite ' },
+      { type: 'pageNumber' },
+      { type: 'text', text: ' von ' },
+      { type: 'pageCount' },
+    ] }] };
+    // Non-default edge distances (header 0.8cm from top, footer 1.6cm from bottom).
+    const hfDist = { headerDistanceCm: 0.8, footerDistanceCm: 1.6 };
+    const hfBytes = await buildOdt(fixture, margins, 'landscape', { header, footer, pageCount: 9, ...hfDist });
+    const hfRes = importOdt(hfBytes);
+
+    check('hf: no warnings', hfRes.warnings.length === 0, hfRes.warnings);
+    check('hf: header round-trips', firstDiff(normalize(header), normalize(hfRes.header)) === null,
+      firstDiff(normalize(header), normalize(hfRes.header)));
+    check('hf: footer round-trips', firstDiff(normalize(footer), normalize(hfRes.footer)) === null,
+      firstDiff(normalize(footer), normalize(hfRes.footer)));
+    // The body margins survive the header/footer geometry mapping.
+    const hm = hfRes.margins!;
+    check('hf: body margins preserved through geometry mapping',
+      !!hm && Math.abs(hm.top - 3) < 0.05 && Math.abs(hm.bottom - 2) < 0.05 &&
+      Math.abs(hm.left - 2.5) < 0.02 && Math.abs(hm.right - 1.5) < 0.02, hm);
+    // The configured edge distances round-trip (they become the ODF page margin).
+    check('hf: header distance round-trips (0.8cm)', Math.abs((hfRes.headerDistanceCm ?? 0) - 0.8) < 0.02, hfRes.headerDistanceCm);
+    check('hf: footer distance round-trips (1.6cm)', Math.abs((hfRes.footerDistanceCm ?? 0) - 1.6) < 0.02, hfRes.footerDistanceCm);
+    check('hf: body still round-trips alongside header/footer',
+      firstDiff(normalize(fixture), normalize(hfRes.content)) === null,
+      firstDiff(normalize(fixture), normalize(hfRes.content)));
+
+    // Imported header/footer must be valid in the header/footer editor schema.
+    const hfSchema = getSchema(hfExtensions());
+    let hfSchemaOk = true;
+    for (const z of [hfRes.header, hfRes.footer]) {
+      if (!z) continue;
+      try { PMNode.fromJSON(hfSchema, z).check(); } catch { hfSchemaOk = false; }
+    }
+    check('hf: header/footer valid in hf schema', hfSchemaOk);
+
+    // Empty zones must not be exported (no master-page header/footer).
+    const emptyHf = await buildOdt(fixture, margins, 'portrait', { header: null, footer: null, pageCount: 1 });
+    const emptyRes = importOdt(emptyHf);
+    check('hf: empty zones not exported', emptyRes.header === null && emptyRes.footer === null);
+  });
+});
+
+describe('Leg 3a: different first page header/footer → buildOdt → importOdt', () => {
+  it('round-trips the first-page variants and the flag alongside the defaults', async () => {
+    // Arial 10pt on the runs AND the page-field atoms, so the field digits keep the font.
+    const arial = [{ type: 'textStyle', attrs: { fontFamily: 'Arial', fontSize: '10pt' } }];
+    const header: N = { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Default header' }] }] };
+    // The strut follows runs that agree on a font (applyUniformRunFont), so the zone
+    // paragraph carries it either way — stating it keeps the round trip an identity.
+    const footer: N = { type: 'doc', content: [{ type: 'paragraph', attrs: { textAlign: 'center', fontFamily: 'Arial', fontSize: '10pt' }, content: [
+      { type: 'text', text: 'Seite ', marks: arial }, { type: 'pageNumber', marks: arial }, { type: 'text', text: ' von ', marks: arial }, { type: 'pageCount', marks: arial },
+    ] }] };
+    const headerFirst: N = { type: 'doc', content: [{ type: 'paragraph', attrs: { fontFamily: 'Arial', fontSize: '10pt' }, content: [
+      { type: 'text', text: 'Cover', marks: [{ type: 'bold' }, ...arial] },
+    ] }] };
+    const footerFirst: N = { type: 'doc', content: [{ type: 'paragraph', content: [
+      { type: 'text', text: 'Stand:   x', marks: arial }, { type: 'text', text: ' ' }, { type: 'pageNumber', marks: arial },
+      { type: 'hardBreak' }, { type: 'hardBreak' },
+    ] }] };
+
+    const bytes = await buildOdt(fixture, margins, 'portrait',
+      { header, footer, headerFirst, footerFirst, differentFirstPage: true, pageCount: 3 });
+    const res = importOdt(bytes);
+
+    check('dfp: no warnings', res.warnings.length === 0, res.warnings);
+    check('dfp: flag round-trips', res.differentFirstPage === true, res.differentFirstPage);
+    check('dfp: default header round-trips', firstDiff(normalize(header), normalize(res.header)) === null, firstDiff(normalize(header), normalize(res.header)));
+    check('dfp: default footer round-trips', firstDiff(normalize(footer), normalize(res.footer)) === null, firstDiff(normalize(footer), normalize(res.footer)));
+    check('dfp: first-page header round-trips (incl. marks)', firstDiff(normalize(headerFirst), normalize(res.headerFirst)) === null, firstDiff(normalize(headerFirst), normalize(res.headerFirst)));
+    check('dfp: first-page footer preserves spacing', res.footerFirst?.content?.[0]?.content?.[0]?.text === 'Stand:   x', res.footerFirst);
+    const ffInline = res.footerFirst?.content?.[0]?.content ?? [];
+    const ffBreaks = ffInline.filter((n: N) => n.type === 'hardBreak').length;
+    check('dfp: first-page footer keeps trailing blank lines', ffBreaks === 2 && ffInline[ffInline.length - 1]?.type === 'hardBreak', ffInline);
+
+    // Every variant must be valid in the header/footer editor schema.
+    const hfSchema = getSchema(hfExtensions());
+    let ok = true;
+    for (const z of [res.header, res.footer, res.headerFirst, res.footerFirst]) {
+      if (!z) continue;
+      try { PMNode.fromJSON(hfSchema, z).check(); } catch { ok = false; }
+    }
+    check('dfp: all variants valid in hf schema', ok);
+
+    // Flag off ⇒ first-page zones aren't exported.
+    const offBytes = await buildOdt(fixture, margins, 'portrait',
+      { header, footer, headerFirst, footerFirst, differentFirstPage: false, pageCount: 3 });
+    const offRes = importOdt(offBytes);
+    check('dfp: first-page zones skipped when flag off', offRes.differentFirstPage === false && offRes.headerFirst === null && offRes.footerFirst === null, offRes);
+
+    // Flag on with an empty first-page footer (default footer present): page 1's footer
+    // is deliberately blank, and the flag still round-trips (element presence = flag).
+    const blankFirst = await buildOdt(fixture, margins, 'portrait',
+      { header: null, footer, headerFirst: null, footerFirst: null, differentFirstPage: true, pageCount: 3 });
+    const blankRes = importOdt(blankFirst);
+    check('dfp: flag survives an empty first-page zone', blankRes.differentFirstPage === true, blankRes.differentFirstPage);
+    check('dfp: empty first-page footer stays blank', blankRes.footerFirst === null, blankRes.footerFirst);
+    check('dfp: default footer still present', firstDiff(normalize(footer), normalize(blankRes.footer)) === null, blankRes.footer);
+  });
+});
+
+describe('Leg 3b: inline images in header/footer → buildOdt → importOdt', () => {
+  it('round-trips an as-char image in a default zone and a first-page zone', async () => {
+    const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNwaDgAAAKEAYEml6crAAAAAElFTkSuQmCC';
+    const img = (w: number, h: number): N => ({ type: 'image', attrs: { src: PNG, alt: 'Logo', width: w, height: h, wrap: 'inline' } });
+    const footer: N = { type: 'doc', content: [P({ textAlign: 'center' }, T('Logo '), img(120, 48))] };
+    const headerFirst: N = { type: 'doc', content: [P(null, img(200, 60))] };
+    const header: N = { type: 'doc', content: [P(null, T('Default header'))] };
+    const res = importOdt(await buildOdt(fixture, margins, 'portrait',
+      { header, footer, headerFirst, footerFirst: null, differentFirstPage: true, pageCount: 3 }));
+    const imgs = (doc: N): N[] => { const o: N[] = []; const w = (n: N) => { if (!n) return; if (n.type === 'image') o.push(n); (n.content ?? []).forEach(w); }; w(doc); return o; };
+
+    check('hf image: no warnings', res.warnings.length === 0, res.warnings);
+    const fi = imgs(res.footer);
+    check('hf image: default footer keeps one image', fi.length === 1, res.footer);
+    check('hf image: src is a data-URI', /^data:image\//.test(fi[0]?.attrs?.src ?? ''), fi[0]?.attrs?.src?.slice(0, 24));
+    check('hf image: size preserved (px→cm→px)', Math.abs(fi[0]?.attrs?.width - 120) <= 2 && Math.abs(fi[0]?.attrs?.height - 48) <= 2, fi[0]?.attrs);
+    check('hf image: stays inline (as-char)', (fi[0]?.attrs?.wrap ?? 'inline') === 'inline', fi[0]?.attrs?.wrap);
+    check('hf image: first-page header keeps its image', imgs(res.headerFirst).length === 1, res.headerFirst);
+
+    // Both zones must remain valid in the header/footer editor schema.
+    const hfSchema = getSchema(hfExtensions());
+    let ok = true;
+    for (const z of [res.footer, res.headerFirst]) { if (!z) continue; try { PMNode.fromJSON(hfSchema, z).check(); } catch { ok = false; } }
+    check('hf image: zones valid in hf schema', ok);
+  });
+});
+
+describe('Leg 3c: odd/even page header/footer → buildOdt → importOdt', () => {
+  it('round-trips the even-page variants and the flag alongside default + first', async () => {
+    const header: N = { type: 'doc', content: [P(null, T('Default header'))] };
+    const footer: N = { type: 'doc', content: [P(null, T('Default footer'))] };
+    const headerEven: N = { type: 'doc', content: [P({ textAlign: 'right' }, T('Even header'))] };
+    const footerEven: N = { type: 'doc', content: [P({ textAlign: 'center' }, T('Even footer'))] };
+    const headerFirst: N = { type: 'doc', content: [P(null, T('First header'))] };
+    const bytes = await buildOdt(fixture, margins, 'portrait',
+      { header, footer, headerEven, footerEven, differentOddEven: true, headerFirst, footerFirst: null, differentFirstPage: true, pageCount: 4 });
+    check('odd/even: styles.xml has <style:header-left>', strFromU8(unzipSync(bytes)['styles.xml']).includes('<style:header-left>'));
+
+    const res = importOdt(bytes);
+    check('odd/even: no warnings', res.warnings.length === 0, res.warnings);
+    check('odd/even: flag round-trips', res.differentOddEven === true, res.differentOddEven);
+    check('odd/even: even header round-trips', firstDiff(normalize(headerEven), normalize(res.headerEven)) === null, res.headerEven);
+    check('odd/even: even footer round-trips', firstDiff(normalize(footerEven), normalize(res.footerEven)) === null, res.footerEven);
+    check('odd/even: default + first still round-trip',
+      firstDiff(normalize(header), normalize(res.header)) === null && firstDiff(normalize(headerFirst), normalize(res.headerFirst)) === null, res.header);
+
+    const hfSchema = getSchema(hfExtensions());
+    let ok = true;
+    for (const z of [res.headerEven, res.footerEven]) { if (!z) continue; try { PMNode.fromJSON(hfSchema, z).check(); } catch { ok = false; } }
+    check('odd/even: even zones valid in hf schema', ok);
+  });
+});
+
+describe('Leg 4: foreign header/footer → importOdt', () => {
+  it('parses page-number/count fields, reconstructs body margins, imports the first-page variant', () => {
+    const fStyles = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+ <office:styles>
+  <style:default-style style:family="paragraph"><style:text-properties fo:font-size="12pt"/></style:default-style>
+  <style:style style:name="Standard" style:family="paragraph"/>
+  <style:style style:name="Header" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties fo:text-align="center"/></style:style>
+  <style:style style:name="Footer" style:family="paragraph" style:parent-style-name="Standard"/>
+ </office:styles>
+ <office:automatic-styles>
+  <style:page-layout style:name="pm1">
+   <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" fo:margin-top="1.5cm" fo:margin-bottom="1.5cm" fo:margin-left="2cm" fo:margin-right="2cm"/>
+   <style:header-style><style:header-footer-properties svg:height="0.8cm" fo:margin-bottom="0.3cm"/></style:header-style>
+   <style:footer-style><style:header-footer-properties svg:height="0.6cm" fo:margin-top="0.3cm"/></style:footer-style>
+  </style:page-layout>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Standard" style:page-layout-name="pm1">
+   <style:header><text:p text:style-name="Header"><text:span text:style-name="X">Doc</text:span> — Page <text:page-number text:select-page="current">1</text:page-number> of <text:page-count>5</text:page-count></text:p></style:header>
+   <style:header-first><text:p text:style-name="Header">Cover</text:p></style:header-first>
+   <style:footer><text:p text:style-name="Footer">Confidential</text:p></style:footer>
+  </style:master-page>
+ </office:master-styles>
+</office:document-styles>`;
+    const fContent = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text><text:p>Body</text:p></office:text></office:body></office:document-content>`;
+    const foreignHf = zipSync({
+      mimetype: [strToU8('application/vnd.oasis.opendocument.text'), { level: 0 }],
+      'content.xml': [strToU8(fContent), { level: 6 }],
+      'styles.xml': [strToU8(fStyles), { level: 6 }],
+    } as any);
+    const fhf = importOdt(foreignHf);
+
+    check('foreign hf: header parsed with center align', fhf.header?.content?.[0]?.attrs?.textAlign === 'center', fhf.header);
+    const hPara = fhf.header?.content?.[0];
+    check('foreign hf: page-number field', hPara?.content?.some((n: N) => n.type === 'pageNumber'), hPara);
+    check('foreign hf: page-count field', hPara?.content?.some((n: N) => n.type === 'pageCount'), hPara);
+    check('foreign hf: footer text', fhf.footer?.content?.[0]?.content?.[0]?.text === 'Confidential', fhf.footer);
+    // Body top margin = page margin (1.5) + the header band (0.8): its 0.3 spacing to
+    // the body is laid out inside that height, not added to it (styleResolver.ts).
+    check('foreign hf: body top margin reconstructed', Math.abs((fhf.margins?.top ?? 0) - 2.3) < 0.02, fhf.margins);
+    check('foreign hf: body bottom margin reconstructed', Math.abs((fhf.margins?.bottom ?? 0) - 2.1) < 0.02, fhf.margins);
+    // header-first is a supported variant (Word "Different First Page" / ODF header-first).
+    check('foreign hf: first-page header parsed', fhf.headerFirst?.content?.[0]?.content?.[0]?.text === 'Cover', fhf.headerFirst);
+    check('foreign hf: different-first-page flag set', fhf.differentFirstPage === true, fhf.differentFirstPage);
+    check('foreign hf: no unsupported-variant warning', !fhf.warnings.some(w => /per-page/i.test(w)), fhf.warnings);
+  });
+});
+
+describe('Leg 6: text boxes / shapes (ODT)', () => {
+  const boxDoc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('before')),
+      PBX({ width: 288, height: 96, fillColor: '#FFFFFF', strokeColor: '#000000', strokeWidthPt: 1 },
+        P(null, T('plain box')),
+        P(null, T('with '), T('marks', { type: 'italic' })),
+      ),
+      PBX({ width: 192, height: 96, wrap: 'right', shapeKind: 'ellipse', fillColor: '#FFEE00', strokeColor: '#FF0000', strokeWidthPt: 2.25, rotation: 30 },
+        P(null, T('in ellipse')),
+      ),
+      PBX({ width: 192, height: 80, wrap: 'left', shapeKind: 'roundRect', fillColor: null, strokeColor: null },
+        P(null, T('transparent round')),
+      ),
+      P(null, T('after')),
+    ],
+  };
+
+  it('emits frames/shapes with graphic styles and round-trips every attr', async () => {
+    const bytes = await buildOdt(boxDoc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('emits <draw:frame><draw:text-box>', /<draw:frame [^>]*><draw:text-box/.test(xml));
+    check('emits <draw:custom-shape> with ellipse geometry', /<draw:custom-shape[\s\S]*?draw:type="ellipse"/.test(xml));
+    check('emits round-rectangle geometry', xml.includes('draw:type="round-rectangle"'));
+    check('mints TbxFr graphic styles', xml.includes('style:name="TbxFr1"') && xml.includes('style:name="TbxFr3"'));
+    check('graphic style carries fill + stroke', xml.includes('draw:fill-color="#FFEE00"') && xml.includes('svg:stroke-color="#FF0000"'));
+    check('transparent box has fill/stroke none', /draw:fill="none" draw:stroke="none"/.test(xml));
+    check('no leftover TBX sentinel', !xml.includes(''));
+
+    const res = importOdt(bytes);
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    const boxes = boxesIn(res.content);
+    check('all 3 boxes round-trip', boxes.length === 3, (res.content.content ?? []).map((n: N) => n.type));
+
+    const [plain, ellipse, round] = boxes;
+    check('plain box: size 288×96, defaults suppressed', plain?.attrs?.width === 288 && plain?.attrs?.height === 96 &&
+      plain?.attrs?.fillColor === undefined && plain?.attrs?.strokeColor === undefined && plain?.attrs?.shapeKind === undefined, plain?.attrs);
+    check('plain box: both paragraphs + marks survive',
+      plain?.content?.length === 2 && plain?.content?.[1]?.content?.some((n: N) => n.marks?.some((m: N) => m.type === 'italic')), plain?.content);
+    check('ellipse: shapeKind + wrap + rotation', ellipse?.attrs?.shapeKind === 'ellipse' && ellipse?.attrs?.wrap === 'right' && ellipse?.attrs?.rotation === 30, ellipse?.attrs);
+    check('ellipse: fill/stroke/width exact', ellipse?.attrs?.fillColor === '#FFEE00' && ellipse?.attrs?.strokeColor === '#FF0000' && ellipse?.attrs?.strokeWidthPt === 2.25, ellipse?.attrs);
+    check('roundRect: explicit null fill/stroke survive (transparent, no border)',
+      round?.attrs?.shapeKind === 'roundRect' && round?.attrs?.fillColor === null && round?.attrs?.strokeColor === null, round?.attrs);
+    check('document JSON round-trips', firstDiff(normalize(boxDoc), normalize(res.content)) === null,
+      firstDiff(normalize(boxDoc), normalize(res.content)));
+  });
+});
+
+describe('Leg 7: foreign shapes/text boxes → importOdt', () => {
+  it('imports text-box frames + preset shapes, flattens boxes in cells, warns on the rest', () => {
+    const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0">
+ <office:automatic-styles>
+  <style:style style:name="gr1" style:family="graphic">
+   <style:graphic-properties draw:fill="solid" draw:fill-color="#ccffcc" draw:stroke="solid" svg:stroke-color="#003300" svg:stroke-width="0.0292in" style:wrap="left" style:horizontal-pos="right"/>
+  </style:style>
+  <style:style style:name="gr2" style:family="graphic">
+   <style:graphic-properties draw:fill="none" draw:stroke="none"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body><office:text>
+  <text:p>anchor <draw:frame draw:style-name="gr1" text:anchor-type="paragraph" svg:width="2in" svg:x="1cm" svg:y="2cm"><draw:text-box fo:min-height="1in"><text:p>floating box</text:p><text:p>second</text:p></draw:text-box></draw:frame>text continues</text:p>
+  <text:p><draw:rect draw:style-name="gr2" text:anchor-type="as-char" svg:width="5.08cm" svg:height="2.54cm"><text:p>rect text</text:p></draw:rect></text:p>
+  <text:p><draw:custom-shape draw:style-name="gr1" text:anchor-type="as-char" svg:width="5.08cm" svg:height="2.54cm"><text:p>lo ellipse</text:p><draw:enhanced-geometry svg:viewBox="0 0 21600 21600" draw:glue-points="10800 0 3163 3163 0 10800" draw:text-areas="3163 3163 18437 18437" draw:type="ellipse" draw:enhanced-path="U 10800 10800 10800 10800 0 360 Z N"/></draw:custom-shape></text:p>
+  <text:p><draw:custom-shape text:anchor-type="as-char" svg:width="2cm" svg:height="2cm"><text:p>star</text:p><draw:enhanced-geometry draw:type="star5"/></draw:custom-shape></text:p>
+  <text:p><draw:custom-shape text:anchor-type="as-char" svg:width="2cm" svg:height="2cm"><text:p>smiley</text:p><draw:enhanced-geometry draw:type="smiley"/></draw:custom-shape></text:p>
+  <text:p><draw:line svg:x1="0cm" svg:y1="0cm" svg:x2="5cm" svg:y2="0cm"/></text:p>
+  <table:table>
+   <table:table-column/>
+   <table:table-row><table:table-cell><text:p>cell <draw:frame text:anchor-type="as-char" svg:width="2cm"><draw:text-box><text:p>box in cell</text:p></draw:text-box></draw:frame></text:p></table:table-cell></table:table-row>
+  </table:table>
+ </office:text></office:body>
+</office:document-content>`;
+    const foreign = zipSync({
+      mimetype: [strToU8('application/vnd.oasis.opendocument.text'), { level: 0 }],
+      'content.xml': [strToU8(contentXml), { level: 6 }],
+    } as any);
+
+    const f = importOdt(foreign);
+    const c = f.content.content!;
+    const boxes = boxesIn(f.content);
+    check('6 supported shapes imported', boxes.length === 6, c.map((n: N) => n.type));
+
+    const [floatBox, rect, ellipse, star, line, inCell] = boxes;
+    check('frame: free x/y collapses to wrap side (right)', floatBox?.attrs?.wrap === 'right', floatBox?.attrs);
+    check('frame: 2in → 192px, min-height 1in → 96px', floatBox?.attrs?.width === 192 && floatBox?.attrs?.height === 96, floatBox?.attrs);
+    check('frame: fill + stroke from graphic style', floatBox?.attrs?.fillColor === '#CCFFCC' && floatBox?.attrs?.strokeColor === '#003300', floatBox?.attrs);
+    check('frame: stroke width 0.0292in → ≈2.1pt', Math.abs((floatBox?.attrs?.strokeWidthPt ?? 0) - 2.1) < 0.05, floatBox?.attrs);
+    check('frame: both paragraphs kept', floatBox?.content?.length === 2, floatBox?.content);
+    check('frame: the text around it is kept, the box between the two runs',
+      c[0]?.content?.map((n: N) => n.text ?? `[${n.type}]`).join('') === 'anchor [textBox]text continues', c[0]);
+    check('rect: imports as plain textbox, transparent', rect?.attrs?.shapeKind === undefined && rect?.attrs?.fillColor === null && rect?.attrs?.strokeColor === null, rect?.attrs);
+    check('rect: text preserved', rect?.content?.[0]?.content?.[0]?.text === 'rect text', rect?.content);
+    check('custom-shape ellipse: shapeKind + geometry', ellipse?.attrs?.shapeKind === 'ellipse' && ellipse?.attrs?.width === 192 && ellipse?.attrs?.height === 96, ellipse?.attrs);
+    check('star5: preset kept', star?.attrs?.shapeKind === 'star5', star?.attrs);
+    check('a preset we can\'t draw is dropped with a warning', f.warnings.includes('Unsupported shapes were removed'), f.warnings);
+    // A 5cm horizontal draw:line: two endpoints, so it arrives as a flat frame.
+    check('draw:line: a plain line, no heads declared', line?.attrs?.shapeKind === 'line', line?.attrs);
+    check('draw:line: 5cm wide and flat', line?.attrs?.width === 189 && line?.attrs?.height === 0, line?.attrs);
+
+    // A box reaches a cell through the cell's paragraph, as it does in Word.
+    check('box in cell kept as a box', inCell?.content?.[0]?.content?.[0]?.text === 'box in cell', inCell);
+    check('no flatten warning', !f.warnings.some(w => /nested in table cells/.test(w)), f.warnings);
+  });
+});
+
+describe('Leg 8: multi-column sections (ODT)', () => {
+  const colsDoc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('before')),
+      COLS({ count: 2, gapCm: 0.8 },
+        P(null, T('col text with '), T('bold', { type: 'bold' })),
+        { type: 'bulletList', content: [
+          LI(P(null, T('col bullet one'))),
+          LI(P(null, T('col bullet two'))),
+        ] },
+        H({ level: 3 }, T('Col heading')),
+      ),
+      P(null, T('between')),
+      COLS({ count: 3, gapCm: 0.5 }, P(null, T('three column text'))),
+      P(null, T('after')),
+    ],
+  };
+
+  it('emits <text:section> with a section style and round-trips attrs + content', async () => {
+    const bytes = await buildOdt(colsDoc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('emits <text:section> with the minted style', /<text:section text:style-name="ColSec1"/.test(xml));
+    check('mints a section-family style', xml.includes('style:family="section"'));
+    check('2-col style carries count + gap', xml.includes('fo:column-count="2"') && xml.includes('fo:column-gap="0.8cm"'));
+    check('3-col style carries count + default gap', xml.includes('fo:column-count="3"') && xml.includes('fo:column-gap="0.5cm"'));
+    check('columns balance (dont-balance false)', xml.includes('text:dont-balance-text-columns="false"'));
+    check('section content is real block markup', /<text:section[^>]*>[\s\S]*?<text:list/.test(xml));
+    check('no leftover COL sentinel', !xml.includes(''));
+
+    const res = importOdt(bytes);
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    const cols = (res.content.content ?? []).filter((n: N) => n.type === 'columns');
+    check('both sections round-trip', cols.length === 2, (res.content.content ?? []).map((n: N) => n.type));
+    const [two, three] = cols;
+    check('2-col attrs exact', two?.attrs?.count === 2 && two?.attrs?.gapCm === 0.8, two?.attrs);
+    check('3-col attrs exact', three?.attrs?.count === 3 && three?.attrs?.gapCm === 0.5, three?.attrs);
+    check('marks + list + heading survive inside the section',
+      two?.content?.[0]?.content?.some((n: N) => n.marks?.some((m: N) => m.type === 'bold')) &&
+      two?.content?.[1]?.type === 'bulletList' && two?.content?.[2]?.type === 'heading', two?.content);
+    check('document JSON round-trips', firstDiff(normalize(colsDoc), normalize(res.content)) === null,
+      firstDiff(normalize(colsDoc), normalize(res.content)));
+  });
+
+  it('coalesces adjacent equal-attr fragments (columnsFlow page splits) into one section', async () => {
+    const fragmented: N = {
+      type: 'doc',
+      content: [
+        COLS({ count: 2, gapCm: 0.5 }, P(null, T('frag one a')), P(null, T('frag one b'))),
+        COLS({ count: 2, gapCm: 0.5 }, P(null, T('frag two'))),
+        COLS({ count: 3, gapCm: 0.5 }, P(null, T('other section'))),
+        P(null, T('tail')),
+      ],
+    };
+    const bytes = await buildOdt(fragmented, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('two sections emitted (chain merged, 3-col separate)',
+      (xml.match(/<text:section /g) ?? []).length === 2, (xml.match(/<text:section /g) ?? []).length);
+
+    const res = importOdt(bytes);
+    const cols = (res.content.content ?? []).filter((n: N) => n.type === 'columns');
+    check('chain reimports as one node with all three blocks',
+      cols.length === 2 && cols[0]?.content?.length === 3 && cols[1]?.content?.length === 1,
+      cols.map((n: N) => n.content?.length));
+  });
+
+  it('re-merges a page-boundary line-split paragraph (joinPrev) on export', async () => {
+    const split: N = {
+      type: 'doc',
+      content: [
+        COLS({ count: 2, gapCm: 0.5 },
+          P(null, T('intact lead. ')),
+          P(null, T('first half of the long paragraph ')),
+        ),
+        COLS({ count: 2, gapCm: 0.5 },
+          P({ joinPrev: true }, T('second half of it.')),
+          P(null, T('intact tail.')),
+        ),
+        P(null, T('after')),
+      ],
+    };
+    const bytes = await buildOdt(split, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('split paragraph exported as ONE text:p',
+      /first half of the long paragraph second half of it\./.test(xml.replace(/<[^>]+>/g, '')), null);
+    check('one section, three paragraphs inside',
+      (xml.match(/<text:section /g) ?? []).length === 1, null);
+
+    const res = importOdt(bytes);
+    const col = (res.content.content ?? []).find((n: N) => n.type === 'columns');
+    check('reimports as one section with three paragraphs', col?.content?.length === 3, col?.content?.length);
+    const texts = (col?.content ?? []).map((p: N) => (p.content ?? []).map((t: N) => t.text).join(''));
+    check('merged paragraph text intact',
+      texts[1] === 'first half of the long paragraph second half of it.', texts);
+  });
+});
+
+describe('Leg 9: foreign multi-column sections → importOdt', () => {
+  it('derives the gap from column indents, moves tables out, clamps counts, splices style-less sections', () => {
+    const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">
+ <office:automatic-styles>
+  <style:style style:name="Sect1" style:family="section">
+   <style:section-properties style:editable="false">
+    <style:columns fo:column-count="2">
+     <style:column style:rel-width="4818*" fo:start-indent="0cm" fo:end-indent="0.25cm"/>
+     <style:column style:rel-width="4818*" fo:start-indent="0.25cm" fo:end-indent="0cm"/>
+    </style:columns>
+   </style:section-properties>
+  </style:style>
+  <style:style style:name="Sect2" style:family="section">
+   <style:section-properties>
+    <style:columns fo:column-count="2" fo:column-gap="1cm"/>
+   </style:section-properties>
+  </style:style>
+  <style:style style:name="Sect3" style:family="section">
+   <style:section-properties>
+    <style:columns fo:column-count="4" fo:column-gap="0.3cm"/>
+   </style:section-properties>
+  </style:style>
+ </office:automatic-styles>
+ <office:body><office:text>
+  <text:section text:style-name="Sect1" text:name="S1">
+   <text:p>lo col one</text:p>
+   <text:p>lo col two</text:p>
+  </text:section>
+  <text:section text:style-name="Sect2" text:name="S2">
+   <text:p>before table</text:p>
+   <table:table>
+    <table:table-column/>
+    <table:table-row><table:table-cell><text:p>in table</text:p></table:table-cell></table:table-row>
+   </table:table>
+   <text:p>after table</text:p>
+  </text:section>
+  <text:section text:style-name="Sect3" text:name="S3">
+   <text:p>four cols</text:p>
+  </text:section>
+  <text:section text:name="S4">
+   <text:p>plain section text</text:p>
+  </text:section>
+ </office:text></office:body>
+</office:document-content>`;
+    const foreign = zipSync({
+      mimetype: [strToU8('application/vnd.oasis.opendocument.text'), { level: 0 }],
+      'content.xml': [strToU8(contentXml), { level: 6 }],
+    } as any);
+
+    const f = importOdt(foreign);
+    const c = f.content.content!;
+    const cols = c.filter((n: N) => n.type === 'columns');
+    check('4 columns nodes (S1, S2 split around the table, S3)', cols.length === 4, c.map((n: N) => n.type));
+
+    const s1 = cols[0];
+    check('S1: gap derived from column indents (0.25+0.25)', s1?.attrs?.count === 2 && s1?.attrs?.gapCm === 0.5, s1?.attrs);
+    check('S1: both paragraphs inside', s1?.content?.length === 2 && s1?.content?.[0]?.content?.[0]?.text === 'lo col one', s1?.content);
+
+    const s2idx = c.findIndex((n: N) => n.type === 'columns' && n.content?.[0]?.content?.[0]?.text === 'before table');
+    check('S2: table moved out between two columns nodes',
+      c[s2idx]?.attrs?.gapCm === 1 && c[s2idx + 1]?.type === 'table' &&
+      c[s2idx + 2]?.type === 'columns' && c[s2idx + 2]?.content?.[0]?.content?.[0]?.text === 'after table',
+      c.slice(s2idx, s2idx + 3).map((n: N) => n.type));
+    check('S2: move-out warning reported',
+      f.warnings.includes('Tables and text boxes inside a multi-column layout were moved out of the columns'), f.warnings);
+
+    const s3 = cols[cols.length - 1];
+    check('S3: count clamped to 3', s3?.attrs?.count === 3 && s3?.attrs?.gapCm === 0.3, s3?.attrs);
+    check('S3: clamp warning reported', f.warnings.includes('Sections with more than 3 columns were reduced to 3 columns'), f.warnings);
+
+    check('style-less section spliced to plain paragraphs',
+      c.some((n: N) => n.type === 'paragraph' && n.content?.[0]?.text === 'plain section text'), c.map((n: N) => n.type));
+  });
+});
+
+describe('Leg 5: table of contents (text:table-of-content)', () => {
+  const tocDoc: N = {
+    type: 'doc',
+    content: [
+      { type: 'tableOfContents', attrs: { entries: [
+        { text: 'Introduction', level: 1, page: 1 },
+        { text: 'Background & Aims', level: 2, page: 2 },
+        { text: 'Deep Dive', level: 3, page: 3 },
+      ] } },
+      H({ level: 1 }, T('Introduction')),
+      P(null, T('intro text')),
+      H({ level: 2 }, T('Background & Aims')),
+      H({ level: 3 }, T('Deep Dive')),
+    ],
+  };
+
+  it('exports a real <text:table-of-content> and re-imports it as a tableOfContents node', async () => {
+    const bytes = await buildOdt(tocDoc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('emits <text:table-of-content>', content.includes('<text:table-of-content '), content.slice(0, 200));
+    check('source spans all heading levels', content.includes(`<text:table-of-content-source text:outline-level="${MAX_HEADING_LEVEL}"`));
+    check('mints Contents_20_1 style', content.includes('style:name="Contents_20_1"'));
+    check('cached entry carries a tab + page', /Contents_20_1">Introduction<text:tab\/>1<\/text:p>/.test(content));
+    check('ampersand in entry text is escaped', content.includes('Background &amp; Aims'));
+    check('no leftover sentinel', !content.includes(''));
+
+    const res = importOdt(bytes);
+    const blocks = res.content.content ?? [];
+    const toc = blocks.find((n: N) => n.type === 'tableOfContents');
+    check('imports a tableOfContents node', !!toc, blocks.map((n: N) => n.type));
+    const entries = toc?.attrs?.entries ?? [];
+    check('3 entries parsed', entries.length === 3, entries);
+    check('entry 1 text/level', entries[0]?.text === 'Introduction' && entries[0]?.level === 1, entries[0]);
+    check('entry 2 text/level (ampersand)', entries[1]?.text === 'Background & Aims' && entries[1]?.level === 2, entries[1]);
+    check('entry 3 level 3', entries[2]?.level === 3, entries[2]);
+    check('headings after the TOC survive',
+      blocks.some((n: N) => n.type === 'heading' && n.content?.[0]?.text === 'Introduction'));
+  });
+
+  // Listing deeper than the index asks for inflates it by whole pages; a title the file
+  // doesn't have doubles the heading standing above it.
+  it('round-trips the index depth and a title-less index', async () => {
+    const shallow: N = { ...tocDoc, content: [
+      { type: 'tableOfContents', attrs: { entries: [], title: '', maxLevel: 1 } },
+      ...(tocDoc.content ?? []).slice(1),
+    ] };
+    const bytes = await buildOdt(shallow, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('source stops at the index depth', content.includes('<text:table-of-content-source text:outline-level="1"'));
+    check('one entry template only', (content.match(/<text:table-of-content-entry-template/g) ?? []).length === 1);
+    check('no index title emitted', !content.includes('<text:index-title'));
+
+    const toc = (importOdt(bytes).content.content ?? []).find((n: N) => n.type === 'tableOfContents');
+    check('maxLevel survives', toc?.attrs?.maxLevel === 1, toc?.attrs);
+    check('title stays empty', toc?.attrs?.title === '', toc?.attrs);
+  });
+});
+
+describe('Leg 10: date/time fields (text:date / text:time)', () => {
+  const DTF = (kind: string, format: string, fixed: boolean, value: string, marks?: N[]): N =>
+    ({ type: 'dateTimeField', attrs: { kind, format, fixed, value }, ...(marks ? { marks } : {}) });
+  const FONT = { type: 'textStyle', attrs: { fontFamily: 'Calibri' } };
+  const dtDoc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('Signed on '), DTF('date', 'dmy_dots', true, '2026-07-08T14:30:45', [FONT]), T(' at '),
+              DTF('time', 'hms24', true, '2026-07-08T14:30:45')),
+      P(null, T('Printed: '), DTF('date', 'weekday_mdy', false, '2026-07-08T09:00:00')),
+    ],
+  };
+
+  it('exports <text:date>/<text:time> with a minted number style and re-imports the fields', async () => {
+    const bytes = await buildOdt(dtDoc, margins, 'portrait', undefined, { language: 'de', country: 'DE' });
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('emits <text:date>', content.includes('<text:date '), content.slice(0, 120));
+    check('emits <text:time>', content.includes('<text:time '));
+    check('fixed date carries text:fixed=true', /<text:date[^>]*text:fixed="true"/.test(content));
+    check('auto date carries text:fixed=false', /<text:date[^>]*text:fixed="false"/.test(content));
+    check('date-value present', content.includes('text:date-value="2026-07-08T14:30:45"'));
+    // xsd dateTime, as LibreOffice writes it — a PT…S duration is a schema violation.
+    check('time-value present', content.includes('text:time-value="2026-07-08T14:30:45"'));
+    check('mints a number:date-style', content.includes('<number:date-style '));
+    check('mints a number:time-style', content.includes('<number:time-style '));
+    check('declares number namespace', content.includes('xmlns:number='));
+    check('no leftover sentinel', !content.includes(''));
+
+    const res = importOdt(bytes);
+    const fields: N[] = [];
+    (function walk(n: N) { if (n.type === 'dateTimeField') fields.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    check('3 date/time fields imported', fields.length === 3, fields.map((f) => f.attrs));
+    const fixedDate = fields.find((f) => f.attrs.kind === 'date' && f.attrs.fixed);
+    check('fixed date format round-trips', fixedDate?.attrs.format === 'dmy_dots', fixedDate?.attrs);
+    check('fixed date value round-trips', fixedDate?.attrs.value === '2026-07-08T14:30:45', fixedDate?.attrs);
+    // The field carries the surrounding font so the atom doesn't fall back to the
+    // editor default (regression: DOCX date field imported without its font).
+    const font = (fixedDate?.marks ?? []).find((m: N) => m.type === 'textStyle')?.attrs?.fontFamily;
+    check('fixed date carries its font mark', font === 'Calibri', fixedDate?.marks);
+    const fixedTime = fields.find((f) => f.attrs.kind === 'time');
+    check('fixed time format round-trips', fixedTime?.attrs.format === 'hms24', fixedTime?.attrs);
+    const autoDate = fields.find((f) => f.attrs.kind === 'date' && !f.attrs.fixed);
+    check('auto date format round-trips', autoDate?.attrs.format === 'weekday_mdy', autoDate?.attrs);
+    check('surrounding text preserved',
+      (res.content.content ?? [])[0]?.content?.[0]?.text === 'Signed on ');
+  });
+});
+
+describe('Leg 11: heading levels 4 and 5', () => {
+  const doc: N = {
+    type: 'doc',
+    content: [H({ level: 4 }, T('Fourth')), H({ level: 5 }, T('Fifth'))],
+  };
+
+  it('exports Heading_20_4/5 at the editor sizes and re-imports the levels', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const files = unzipSync(bytes);
+    const content = strFromU8(files['content.xml']);
+    const styles = strFromU8(files['styles.xml']);
+    check('h4 outline level', content.includes('text:outline-level="4"'), content.slice(0, 400));
+    check('h5 outline level', content.includes('text:outline-level="5"'));
+    check('Heading_20_4 sized 13pt',
+      /style:name="Heading_20_4"[\s\S]*?fo:font-size="13pt"/.test(styles));
+    check('Heading_20_5 sized 12pt',
+      /style:name="Heading_20_5"[\s\S]*?fo:font-size="12pt"/.test(styles));
+
+    const blocks = importOdt(bytes).content.content ?? [];
+    check('h4 round-trips', blocks[0]?.type === 'heading' && blocks[0]?.attrs?.level === 4, blocks[0]);
+    check('h5 round-trips', blocks[1]?.type === 'heading' && blocks[1]?.attrs?.level === 5, blocks[1]);
+    // Sizes equal to the level defaults must not land as explicit fontSize marks.
+    check('no explicit size mark on h4', !(blocks[0]?.content?.[0]?.marks ?? []).length, blocks[0]?.content);
+    check('no explicit size mark on h5', !(blocks[1]?.content?.[0]?.marks ?? []).length, blocks[1]?.content);
+  });
+});
+
+describe('Leg 12: named paragraph styles (ODF)', () => {
+  const sheet = builtinStyleSheet();
+  sheet.paragraph['Merksatz'] = {
+    name: 'Merksatz', parent: 'Standard', next: 'Standard',
+    para: { indent: 2, spaceBefore: 6, lineHeight: '1.15' }, text: { bold: true, color: '#0000AA' },
+  };
+
+  const doc: N = {
+    type: 'doc',
+    content: [
+      H({ level: 1 }, T('Kapitel')),
+      P({ styleName: 'Merksatz' }, T('gemerkt')),
+      // Hard formatting on top of the style must stay direct formatting.
+      P({ styleName: 'Merksatz', spaceAfter: 20 }, T('mit Abstand')),
+      P({ styleName: 'Quotations' }, T('zitiert')),
+    ],
+  };
+
+  it('writes real named styles and round-trips the assignment', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', sheet);
+    const files = unzipSync(bytes);
+    const styles = strFromU8(files['styles.xml']);
+    const content = strFromU8(files['content.xml']);
+
+    const merk = styles.match(/<style:style style:name="Merksatz"[\s\S]*?<\/style:style>/)?.[0] ?? '';
+    check('mints the user style with its parent', merk.includes('style:parent-style-name="Standard"'), merk);
+    check('user style carries its own props', merk.includes('fo:margin-left="2cm"') && merk.includes('fo:color="#0000AA"'), merk);
+    check('heading styles inherit from Heading', /style:name="Heading_20_1"[\s\S]*?style:parent-style-name="Heading"/.test(styles));
+    check('the Heading parent holds the sans font', /style:name="Heading"[\s\S]*?style:font-name="Arial"/.test(styles));
+    check('no leftover sentinel', !content.includes('\uE00D'));
+
+    const res = importOdt(bytes);
+    const blocks = res.content.content ?? [];
+    check('block references its style', blocks[1]?.attrs?.styleName === 'Merksatz', blocks[1]?.attrs);
+    check('built-in style assignment round-trips', blocks[3]?.attrs?.styleName === 'Quotations', blocks[3]?.attrs);
+    check('hard formatting stays direct', blocks[2]?.attrs?.spaceAfter === 20, blocks[2]?.attrs);
+    check('style formatting is NOT copied onto the block', !blocks[1]?.content?.[0]?.marks, blocks[1]?.content?.[0]);
+
+    const imported = res.styles.paragraph['Merksatz'];
+    check('the style itself round-trips', imported?.parent === 'Standard', imported);
+    check('with its own properties', imported?.text.bold === true && imported?.text.color === '#0000AA'
+      && imported?.para.indent === 2 && imported?.para.spaceBefore === 6, imported);
+    // A style's proportional spacing is a bare factor; the file takes a percentage.
+    check('style line spacing round-trips', imported?.para.lineHeight === '1.15', imported?.para);
+    const docx = await buildDocx(doc, margins, 'portrait', undefined, null, 'A4', sheet);
+    const docxStyles = strFromU8(unzipSync(docx)['word/styles.xml']);
+    check('DOCX style carries the spacing', /w:styleId="Merksatz"[\s\S]*?w:line="276"/.test(docxStyles), docxStyles.slice(0, 200));
+    // A heading keeps rendering from the registry, not from copied attrs.
+    check('heading needs no direct formatting', !blocks[0]?.content?.[0]?.marks, blocks[0]);
+  });
+});
+
+describe('Leg 13: named character styles (ODF)', () => {
+  const sheet = builtinStyleSheet();
+  sheet.character['Signal'] = {
+    name: 'Signal', parent: null, next: null, para: {}, text: { bold: true, color: '#CC0000' },
+  };
+  const CS = (text: string, name: string, ...extra: N[]): N =>
+    ({ type: 'text', text, marks: [{ type: 'charStyle', attrs: { name } }, ...extra] });
+
+  const doc: N = {
+    type: 'doc',
+    content: [P(null, T('plain '), CS('emphasised', 'Emphasis'), T(' and '), CS('signal', 'Signal', { type: 'italic' }))],
+  };
+
+  it('writes style:family="text" styles and round-trips the run assignment', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', sheet);
+    const files = unzipSync(bytes);
+    const styles = strFromU8(files['styles.xml']);
+    const content = strFromU8(files['content.xml']);
+
+    check('mints the built-in Emphasis as a text style',
+      /<style:style style:name="Emphasis" style:family="text"[\s\S]*?fo:font-style="italic"/.test(styles), styles.slice(0, 200));
+    check('mints the user character style', /style:name="Signal" style:family="text"/.test(styles));
+    // The run's span points at the style; its own formatting is baked alongside.
+    check('run references the style via its automatic style',
+      /<style:style style:name="TS\d+"[^>]*style:parent-style-name="Signal"/.test(content), content.slice(0, 400));
+    check('no leftover sentinel', !content.includes('\uE00E'));
+
+    const runs = (importOdt(bytes).content.content?.[0] as N).content as N[];
+    const charOf = (r: N) => (r.marks ?? []).find((m: N) => m.type === 'charStyle')?.attrs?.name;
+    check('plain run stays plain', !runs[0].marks, runs[0]);
+    check('built-in style round-trips', charOf(runs[1]) === 'Emphasis', runs[1]);
+    check('style formatting is not copied onto the run',
+      (runs[1].marks ?? []).every((m: N) => m.type === 'charStyle'), runs[1]);
+    const signal = runs.find((r: N) => charOf(r) === 'Signal');
+    check('user style round-trips', !!signal, runs);
+    check('direct formatting on top survives',
+      (signal?.marks ?? []).some((m: N) => m.type === 'italic'), signal);
+    const imported = importOdt(bytes).styles.character['Signal'];
+    check('the character style itself round-trips',
+      imported?.text.bold === true && imported?.text.color === '#CC0000', imported);
+  });
+});
+
+describe('Leg 14: named list styles (ODF)', () => {
+  const sheet = builtinStyleSheet();
+  sheet.list['Prüfliste'] = {
+    name: 'Prüfliste',
+    levels: [
+      { kind: 'number', numType: 'upper-roman-paren', markerAlign: 'right', indentCm: 0.5 },
+      { kind: 'bullet', bulletChar: '✓' },
+      { kind: 'number', numType: 'lower-alpha' },
+    ],
+  };
+
+  // Two clean assignments (user style with a nested level, a built-in) — these
+  // round-trip byte-for-byte. The overridden list is asserted separately.
+  const cleanDoc: N = { type: 'doc', content: [
+    P(null, T('before')),
+    { type: 'orderedList', attrs: { listStyleName: 'Prüfliste' }, content: [
+      LI(P(null, T('one')), { type: 'bulletList', content: [LI(P(null, T('sub')))] }),
+      LI(P(null, T('two'))),
+    ] },
+    P(null, T('between')),
+    { type: 'bulletList', attrs: { listStyleName: 'Diamond Bullets' }, content: [LI(P(null, T('dash')))] },
+  ] };
+
+  it('writes named text:list-style definitions and round-trips the assignment', async () => {
+    const bytes = await buildOdt(cleanDoc, margins, 'portrait', undefined, null, 'A4', sheet);
+    const files = unzipSync(bytes);
+    const styles = strFromU8(files['styles.xml']);
+    const content = strFromU8(files['content.xml']);
+
+    const def = styles.match(/<text:list-style style:name="Prüfliste"[\s\S]*?<\/text:list-style>/)?.[0] ?? '';
+    check('mints the named definition with its display name', def.includes('style:display-name="Prüfliste"'), styles.slice(0, 300));
+    check('level 1 carries the numbering and the right-set label',
+      /text:level="1" style:num-format="I" style:num-suffix="\)"/.test(def) && def.includes('fo:text-align="end"'), def);
+    check('level 2 is the bullet level', /text:level="2" text:bullet-char="✓"/.test(def), def);
+    check('level 1 margin carries the extra step (1.77cm)', def.includes('fo:margin-left="1.770cm"'), def);
+    check('all ten levels are written', (def.match(/text:level="/g) ?? []).length === 10, def);
+    check('the built-in Diamond Bullets is minted too', /<text:list-style style:name="Diamond_20_Bullets" style:display-name="Diamond Bullets">/.test(styles));
+    check('the list references the named style', content.includes('<text:list text:style-name="Prüfliste">'), content.match(/<text:list [^>]*>/g));
+    check('the bullet list references Diamond Bullets', content.includes('<text:list text:style-name="Diamond_20_Bullets">'));
+    check('nested lists stay bare (they inherit the style)', /<text:list>\s*<text:list-item>/.test(content), content.match(/<text:list[^>]*>/g));
+
+    const res = importOdt(bytes);
+    check('no warnings on own export', res.warnings.length === 0, res.warnings);
+    const diff = firstDiff(normalize(cleanDoc), normalize(res.content));
+    check('document JSON round-trips without accreted attrs', diff === null, diff);
+
+    const imported = res.styles.list['Prüfliste'];
+    check('the style itself round-trips', !!imported, Object.keys(res.styles.list));
+    check('level 1 survives whole', imported?.levels[0]?.numType === 'upper-roman-paren'
+      && imported?.levels[0]?.markerAlign === 'right' && imported?.levels[0]?.indentCm === 0.5, imported?.levels[0]);
+    check('level 2 keeps its bullet', imported?.levels[1]?.bulletChar === '✓', imported?.levels[1]);
+    expect.soft(res.styles.list['Diamond Bullets'], 'the built-in comes back as itself').toEqual(sheet.list['Diamond Bullets']);
+  });
+
+  it('an overridden list keeps the resolved automatic clone and drops the name', async () => {
+    const doc: N = { type: 'doc', content: [
+      { type: 'orderedList', attrs: { listStyleName: 'Outline A.I.1', listStyleType: 'lower-roman' }, content: [LI(P(null, T('broken out')))] },
+    ] };
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', sheet);
+    const files = unzipSync(bytes);
+    const content = strFromU8(files['content.xml']);
+
+    check('the list keeps its automatic style', content.includes('<text:list text:style-name="L1">'), content.match(/<text:list [^>]*>/g));
+    check('no named definition is written', !strFromU8(files['styles.xml']).includes('Outline_20_A.I.1'));
+    check('the clone resolves the override', /<text:list-style style:name="L1">[\s\S]*?text:level="1" style:num-format="i" style:num-suffix="\."/.test(content), content.match(/<text:list-style[\s\S]*?<\/text:list-style>/)?.[0]);
+
+    const list = (importOdt(bytes).content.content ?? []).find((n: N) => n.type === 'orderedList');
+    check('the look survives as direct formatting', list?.attrs?.listStyleType === 'lower-roman', list?.attrs);
+    check('the name is gone', !list?.attrs?.listStyleName, list?.attrs);
+  });
+
+  it('the style level decides a depth\'s kind, whatever species the editor holds', async () => {
+    sheet.list['Tab Test'] = { name: 'Tab Test', levels: [
+      { kind: 'bullet', bulletChar: '–' },
+      ...Array.from({ length: 9 }, () => ({ kind: 'number' as const, numType: 'decimal' as const })),
+    ] };
+    // A Tab-nested tree is bullet lists all the way down; the style numbers depth 2+.
+    const tree = (attrs: N | null): N => ({ type: 'bulletList', ...(attrs ? { attrs } : {}), content: [
+      LI(P(null, T('one')), { type: 'bulletList', content: [LI(P(null, T('two')))] }),
+    ] });
+
+    const clean = await buildOdt({ type: 'doc', content: [tree({ listStyleName: 'Tab Test' })] },
+      margins, 'portrait', undefined, null, 'A4', sheet);
+    const res = importOdt(clean);
+    const top = (res.content.content ?? []).find((n: N) => n.type === 'bulletList');
+    check('the clean list references the named style', top?.attrs?.listStyleName === 'Tab Test', top?.attrs);
+    const nested = top?.content?.[0]?.content?.[1];
+    check('the nested list comes back as the number level says', nested?.type === 'orderedList', nested);
+    check('without accreted attrs', !nested?.attrs, nested?.attrs);
+
+    // Overridden: the automatic clone's level 2 must switch species too.
+    const dirty = await buildOdt({ type: 'doc', content: [tree({ listStyleName: 'Tab Test', bulletChar: '➢' })] },
+      margins, 'portrait', undefined, null, 'A4', sheet);
+    const content = strFromU8(unzipSync(dirty)['content.xml']);
+    const clone = content.match(/<text:list-style style:name="L1">[\s\S]*?<\/text:list-style>/)?.[0] ?? '';
+    check('the clone keeps the bullet level 1', /text:level="1" text:bullet-char="➢"/.test(clone), clone);
+    check('the clone numbers level 2', /<text:list-level-style-number text:level="2" style:num-format="1"/.test(clone), clone);
+    const dirtyTop = (importOdt(dirty).content.content ?? []).find((n: N) => n.type === 'bulletList');
+    check('the overridden look survives without the name',
+      dirtyTop?.attrs?.bulletChar === '➢' && !dirtyTop?.attrs?.listStyleName, dirtyTop?.attrs);
+    check('its nested list is numbered', dirtyTop?.content?.[0]?.content?.[1]?.type === 'orderedList',
+      dirtyTop?.content?.[0]?.content?.[1]);
+    delete sheet.list['Tab Test'];
+  });
+
+  it('a foreign named list style is read back (display name decoded)', async () => {
+    const stylesXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.2">
+ <office:styles>
+  <text:list-style style:name="Foreign_20_List" style:display-name="Foreign List">
+   <text:list-level-style-number text:level="1" style:num-format="A" style:num-suffix=")" text:start-value="5">
+    <style:list-level-properties text:list-level-position-and-space-mode="label-alignment">
+     <style:list-level-label-alignment text:label-followed-by="listtab" text:list-tab-stop-position="2cm" fo:text-indent="-0.635cm" fo:margin-left="2cm"/>
+    </style:list-level-properties>
+   </text:list-level-style-number>
+   <text:list-level-style-bullet text:level="2" text:bullet-char="◦">
+    <style:list-level-properties text:list-level-position-and-space-mode="label-alignment">
+     <style:list-level-label-alignment text:label-followed-by="listtab" text:list-tab-stop-position="3cm" fo:text-indent="-0.635cm" fo:margin-left="3cm"/>
+    </style:list-level-properties>
+   </text:list-level-style-bullet>
+  </text:list-style>
+ </office:styles>
+</office:document-styles>`;
+    const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.2">
+ <office:body><office:text>
+  <text:list text:style-name="Foreign_20_List">
+   <text:list-item><text:p>alpha</text:p>
+    <text:list><text:list-item><text:p>circle</text:p></text:list-item></text:list>
+   </text:list-item>
+  </text:list>
+ </office:text></office:body>
+</office:document-content>`;
+    const bytes = zipSync({
+      mimetype: strToU8('application/vnd.oasis.opendocument.text'),
+      'content.xml': strToU8(contentXml),
+      'styles.xml': strToU8(stylesXml),
+    });
+    const res = importOdt(bytes);
+    const list = (res.content.content ?? []).find((n: N) => n.type === 'orderedList');
+    check('the list references the decoded display name', list?.attrs?.listStyleName === 'Foreign List', list?.attrs);
+    check('no per-level attrs accrete on the nested list', !list?.content?.[0]?.content?.[1]?.attrs, list?.content?.[0]?.content?.[1]);
+    const imported = res.styles.list['Foreign List'];
+    check('the definition lands in the registry', imported?.levels[0]?.numType === 'upper-alpha-paren'
+      && imported?.levels[0]?.startAt === 5 && imported?.levels[1]?.kind === 'bullet', imported);
+    check('the level indent derives from the margin step (2cm → +0.73)', imported?.levels[0]?.indentCm === 0.73, imported?.levels[0]);
+  });
+});
+
+describe('Leg 12: per-section page margins (ODT + DOCX)', () => {
+  const secDoc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('first section')),
+      P({ sectionBreak: true, breakBefore: 'page' }, T('second section')),
+    ],
+  };
+  const wide = { top: 1, bottom: 1.91, left: 3.18, right: 2.41 };
+  const sections = [
+    { ...EMPTY_HF_SET },
+    { ...EMPTY_HF_SET, margins: wide },
+  ];
+
+  it('ODT: the section gets a page layout of its own, shifted off the document one', async () => {
+    const bytes = await buildOdt(secDoc, margins, 'portrait', { sections, pageCount: 2 });
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('section master points at its own layout', /<style:master-page style:name="Section2" style:page-layout-name="([^"]*)Sec2"/.test(styles), styles.slice(0, 200));
+    const res = importOdt(bytes);
+    check('document margins unchanged', JSON.stringify(res.margins) === JSON.stringify(margins), res.margins);
+    const back = res.hfSections?.[1]?.margins ?? null;
+    check('section margins round-trip', JSON.stringify(back) === JSON.stringify(wide), back);
+  });
+
+  // A short front matter on Standard before long chapters on their own masters: the
+  // geometry follows the chapters, the first section's blank header does not.
+  it('ODT: the first section keeps Standard\'s zones under a dominant later master', async () => {
+    const bookDoc: N = { type: 'doc', content: [
+      P(null, T('title page')),
+      P({ sectionBreak: true }, T('chapter one')),
+      ...Array.from({ length: 5 }, (_, i) => P(null, T(`paragraph ${i}`))),
+    ] };
+    const running = { type: 'doc', content: [P(null, T('running head'))] };
+    const bytes = await buildOdt(bookDoc, margins, 'portrait',
+      { sections: [{ ...EMPTY_HF_SET }, { ...EMPTY_HF_SET, header: running }], pageCount: 2 });
+    const res = importOdt(bytes);
+    check('first section has no header', res.header === null, res.header);
+    check('the chapter section keeps its header', JSON.stringify(res.hfSections?.[1]?.header).includes('running head'), res.hfSections?.[1]?.header);
+  });
+
+  it('DOCX: each sectPr carries its own w:pgMar', async () => {
+    const bytes = await buildDocx(secDoc, margins, 'portrait', { sections, pageCount: 2 });
+    const res = importDocx(bytes);
+    check('document margins unchanged', JSON.stringify(res.margins) === JSON.stringify(margins), res.margins);
+    const back = res.hfSections?.[1]?.margins ?? null;
+    check('section margins round-trip', JSON.stringify(back) === JSON.stringify(wide), back);
+  });
+
+  // A roman front matter before a decimal body: the format is the section's, not the
+  // document's, in both formats (ODF style:num-format, Word w:pgNumType w:fmt).
+  const romanSections = [{ ...EMPTY_HF_SET }, { ...EMPTY_HF_SET, pageNumberFormat: 'i' as const }];
+
+  it('ODT: the section layout carries style:num-format', async () => {
+    const bytes = await buildOdt(secDoc, margins, 'portrait', { sections: romanSections, pageCount: 2 });
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('the minted layout is roman', /style:name="[^"]*Sec2"[^>]*>\s*<style:page-layout-properties[^>]*style:num-format="i"/.test(styles.replace(/\n/g, '')), styles.slice(0, 300));
+    const res = importOdt(bytes);
+    check('document format unchanged', res.pageNumbering?.format === '1', res.pageNumbering);
+    check('section format round-trips', res.hfSections?.[1]?.pageNumberFormat === 'i', res.hfSections?.[1]);
+  });
+
+  it('DOCX: the later sectPr carries w:pgNumType w:fmt', async () => {
+    const bytes = await buildDocx(secDoc, margins, 'portrait', { sections: romanSections, pageCount: 2 });
+    const res = importDocx(bytes);
+    check('document format unchanged', res.pageNumbering?.format === '1', res.pageNumbering);
+    check('section format round-trips', res.hfSections?.[1]?.pageNumberFormat === 'i', res.hfSections?.[1]);
+  });
+});
+
+describe('Leg 13: document properties (meta.xml / docProps/core.xml)', () => {
+  const propsDoc: N = { type: 'doc', content: [P(null, T('body'))] };
+  const props = {
+    title: 'Jahresbericht', subject: 'Finanzen', author: 'A. Muster',
+    keywords: 'Bilanz, Prüfung', description: 'Entwurf & Vorlage',
+  };
+
+  it('ODT: meta.xml carries the fields and they come back', async () => {
+    const bytes = await buildOdt(propsDoc, margins, 'portrait', undefined, null, 'A4',
+      builtinStyleSheet(), 1.25, 'add', false, DEFAULT_NOTE_SETTINGS, props);
+    const meta = strFromU8(unzipSync(bytes)['meta.xml']);
+    check('dc:title', meta.includes('<dc:title>Jahresbericht</dc:title>'), meta);
+    check('one meta:keyword per keyword', /<meta:keyword>Bilanz<\/meta:keyword><meta:keyword>Prüfung<\/meta:keyword>/.test(meta));
+    check('ampersand escaped', meta.includes('Entwurf &amp; Vorlage'));
+    check('generator is ours', meta.includes('<meta:generator>EdenText</meta:generator>'));
+    const back = importOdt(bytes).props;
+    check('round-trips whole', JSON.stringify(back) === JSON.stringify(props), back);
+  });
+
+  it('DOCX: docProps/core.xml carries the fields and they come back', async () => {
+    const bytes = await buildDocx(propsDoc, margins, 'portrait', undefined, null, 'A4',
+      builtinStyleSheet(), 1.25, 'add', false, DEFAULT_NOTE_SETTINGS, props);
+    const back = importDocx(bytes).props;
+    check('round-trips whole', JSON.stringify(back) === JSON.stringify(props), back);
+  });
+
+  it('an empty set leaves no fields behind', async () => {
+    const bytes = await buildOdt(propsDoc, margins, 'portrait');
+    const meta = strFromU8(unzipSync(bytes)['meta.xml']);
+    check('no dc:title', !meta.includes('<dc:title>'), meta);
+    const back = importOdt(bytes).props;
+    check('all empty', Object.values(back).every((v) => v === ''), back);
+  });
+});
+
+describe('Leg 14: automatic hyphenation', () => {
+  const hDoc: N = { type: 'doc', content: [P(null, T('Silbentrennung'))] };
+  const args = [margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(), 1.25, 'add', false, DEFAULT_NOTE_SETTINGS, undefined] as const;
+
+  it('ODT: fo:hyphenate rides the base style and comes back', async () => {
+    const on = await buildOdt(hDoc, ...args, true);
+    const styles = strFromU8(unzipSync(on)['styles.xml']);
+    check('written into Standard\'s text properties', /style:name="Standard"[\s\S]*?<style:text-properties[^>]*fo:hyphenate="true"/.test(styles), styles.slice(0, 600));
+    check('on round-trips', importOdt(on).hyphenate === true);
+    const off = await buildOdt(hDoc, ...args, false);
+    check('off writes nothing', !strFromU8(unzipSync(off)['styles.xml']).includes('fo:hyphenate'));
+    check('off round-trips', importOdt(off).hyphenate === false);
+  });
+
+  it('DOCX: w:autoHyphenation rides settings.xml and comes back', async () => {
+    const on = await buildDocx(hDoc, ...args, true);
+    check('in settings.xml', strFromU8(unzipSync(on)['word/settings.xml']).includes('autoHyphenation'));
+    check('on round-trips', importDocx(on).hyphenate === true);
+    const off = await buildDocx(hDoc, ...args, false);
+    check('off round-trips', importDocx(off).hyphenate === false);
+  });
+});
+
+describe('Leg 15: page numbering (format + start value)', () => {
+  const pnDoc: N = { type: 'doc', content: [P(null, T('erste Seite'))] };
+  const args = [margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(), 1.25, 'add', false, DEFAULT_NOTE_SETTINGS, undefined, false] as const;
+  const roman = { format: 'i' as const, start: 7 };
+
+  it('ODT: num-format rides the page layout, the start the first paragraph', async () => {
+    const bytes = await buildOdt(pnDoc, ...args, roman);
+    const files = unzipSync(bytes);
+    check('num-format on the layout', strFromU8(files['styles.xml']).includes('style:num-format="i"'));
+    check('start on the first paragraph', strFromU8(files['content.xml']).includes('style:page-number="7"'));
+    const back = importOdt(bytes).pageNumbering;
+    check('round-trips whole', JSON.stringify(back) === JSON.stringify(roman), back);
+  });
+
+  it('DOCX: w:pgNumType carries both', async () => {
+    const bytes = await buildDocx(pnDoc, ...args, roman);
+    check('in the sectPr', strFromU8(unzipSync(bytes)['word/document.xml']).includes('lowerRoman'));
+    const back = importDocx(bytes).pageNumbering;
+    check('round-trips whole', JSON.stringify(back) === JSON.stringify(roman), back);
+  });
+
+  it('the defaults write nothing', async () => {
+    const bytes = await buildOdt(pnDoc, ...args, { format: '1', start: 1 });
+    const files = unzipSync(bytes);
+    check('no num-format on the layout', !/<style:page-layout-properties[^>]*style:num-format=/.test(strFromU8(files['styles.xml'])));
+    check('no page-number', !strFromU8(files['content.xml']).includes('style:page-number='));
+  });
+});
+
+describe('Leg 16: comments (office:annotation / w:comment)', () => {
+  const CM = (text: string, attrs: N): N => T(text, { type: 'comment', attrs });
+  const attrs = { id: 'c1', author: 'A. Muster', date: '2026-08-14T10:00:00.000Z', text: 'Bitte prüfen', resolved: false };
+  const cDoc: N = { type: 'doc', content: [P(null, T('vor '), CM('markiert', attrs), T(' nach'))] };
+
+  it('ODT: a named annotation brackets the text and comes back', async () => {
+    const bytes = await buildOdt(cDoc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('annotation opens the range', content.includes('<office:annotation office:name="c1"'), content.slice(0, 300));
+    check('carries the author', content.includes('<dc:creator>A. Muster</dc:creator>'));
+    check('carries the body', content.includes('Bitte prüfen'));
+    check('closes the range', content.includes('<office:annotation-end office:name="c1"/>'));
+    check('no leftover sentinel', !/[]/.test(content));
+
+    const back = importOdt(bytes).content as N;
+    const runs = back.content[0].content as N[];
+    const marked = runs.find((r: N) => r.marks?.some((m: N) => m.type === 'comment'));
+    check('the marked run is the annotated text', marked?.text === 'markiert', runs.map((r: N) => r.text));
+    const m = marked?.marks.find((x: N) => x.type === 'comment');
+    check('attrs round-trip', m?.attrs.author === 'A. Muster' && m?.attrs.text === 'Bitte prüfen', m?.attrs);
+    check('neighbours stay uncommented', runs.filter((r: N) => r.marks?.some((x: N) => x.type === 'comment')).length === 1);
+  });
+
+  const threadAttrs = { ...attrs, id: 'c9', replies: [
+    { author: 'B. Zweit', date: '2026-08-15T08:00:00.000Z', text: 'Ist geprüft.' },
+  ] };
+  const tDoc: N = { type: 'doc', content: [P(null, T('vor '), CM('markiert', threadAttrs), T(' nach'))] };
+
+  it('ODT: an answer is its own annotation pointing at the comment', async () => {
+    const bytes = await buildOdt(tDoc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('answer names its parent', content.includes('loext:parent-name="c9"'), content.slice(0, 400));
+    check('answer carries its own author', content.includes('<dc:creator>B. Zweit</dc:creator>'));
+    check('answer closes its range', content.includes('<office:annotation-end office:name="c9_r1"/>'));
+
+    const back = importOdt(bytes).content as N;
+    const runs = back.content[0].content as N[];
+    const marks = runs.flatMap((r: N) => (r.marks ?? []).filter((m: N) => m.type === 'comment'));
+    check('one comment, not two', marks.length === 1, marks);
+    check('the answer came back on it',
+      marks[0]?.attrs.replies?.[0]?.text === 'Ist geprüft.' && marks[0]?.attrs.replies?.[0]?.author === 'B. Zweit',
+      marks[0]?.attrs.replies);
+  });
+
+  it('DOCX: an answer is its own w:comment tied by w15:paraIdParent', async () => {
+    const bytes = await buildDocx(tDoc, margins, 'portrait');
+    const files = unzipSync(bytes);
+    const ex = strFromU8(files['word/commentsExtended.xml'] ?? new Uint8Array());
+    check('the part exists', !!files['word/commentsExtended.xml'], Object.keys(files).join(' '));
+    check('the answer names its parent', /w15:paraIdParent="/.test(ex), ex);
+    check('two comment bodies', (strFromU8(files['word/comments.xml']).match(/<w:comment /g) ?? []).length === 2);
+    check('the answer is referenced at the anchor',
+      (strFromU8(files['word/document.xml']).match(/<w:commentReference /g) ?? []).length === 2);
+
+    const back = importDocx(bytes).content as N;
+    const runs = back.content[0].content as N[];
+    const marks = runs.flatMap((r: N) => (r.marks ?? []).filter((m: N) => m.type === 'comment'));
+    check('one comment, not two', marks.length === 1, marks);
+    check('the answer came back on it', marks[0]?.attrs.replies?.[0]?.text === 'Ist geprüft.', marks[0]?.attrs.replies);
+  });
+
+  it('DOCX: the range brackets the runs and word/comments.xml holds the body', async () => {
+    const bytes = await buildDocx(cDoc, margins, 'portrait');
+    const files = unzipSync(bytes);
+    const doc = strFromU8(files['word/document.xml']);
+    check('range start', doc.includes('<w:commentRangeStart'), doc.slice(0, 200));
+    check('range end', doc.includes('<w:commentRangeEnd'));
+    check('reference run', doc.includes('<w:commentReference'));
+    check('comments part exists', !!files['word/comments.xml']);
+    check('body in the part', strFromU8(files['word/comments.xml'] ?? new Uint8Array()).includes('Bitte prüfen'));
+
+    const back = importDocx(bytes).content as N;
+    const runs = back.content[0].content as N[];
+    const marked = runs.find((r: N) => r.marks?.some((m: N) => m.type === 'comment'));
+    check('the marked run is the annotated text', marked?.text === 'markiert', runs.map((r: N) => r.text));
+    const m = marked?.marks.find((x: N) => x.type === 'comment');
+    check('author and body round-trip', m?.attrs.author === 'A. Muster' && m?.attrs.text === 'Bitte prüfen', m?.attrs);
+  });
+});
+
+describe('Leg 17: the header row repeats on every page', () => {
+  const hdrTable: N = { type: 'doc', content: [
+    { type: 'table', attrs: { repeatHeader: true }, content: [
+      ROW(CELL(null, P(null, T('Kopf A'))), CELL(null, P(null, T('Kopf B')))),
+      ROW(CELL(null, P(null, T('a1'))), CELL(null, P(null, T('b1')))),
+    ] },
+  ] };
+
+  it('ODT: <table:table-header-rows> wraps the first row and comes back', async () => {
+    const bytes = await buildOdt(hdrTable, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('wrapper emitted', content.includes('<table:table-header-rows>'), content.slice(0, 300));
+    check('wraps exactly one row', (content.match(/<table:table-row/g) ?? []).length === 2
+      && /<table:table-header-rows><table:table-row[\s\S]*?<\/table:table-row><\/table:table-header-rows>/.test(content));
+    const back = importOdt(bytes).content as N;
+    check('attr round-trips', back.content[0].attrs?.repeatHeader === true, back.content[0].attrs);
+    check('both rows survive', back.content[0].content.length === 2, back.content[0].content.length);
+  });
+
+  it('DOCX: w:tblHeader rides the first row only and comes back', async () => {
+    const bytes = await buildDocx(hdrTable, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('emitted once', (xml.match(/<w:tblHeader/g) ?? []).length === 1, xml.match(/<w:tblHeader[^>]*>/g));
+    const back = importDocx(bytes).content as N;
+    check('attr round-trips', back.content[0].attrs?.repeatHeader === true, back.content[0].attrs);
+  });
+
+  it('a plain table writes neither', async () => {
+    const plain: N = { type: 'doc', content: [{ type: 'table', content: [ROW(CELL(null, P(null, T('x'))))] }] };
+    check('no ODF wrapper', !strFromU8(unzipSync(await buildOdt(plain, margins, 'portrait'))['content.xml']).includes('table-header-rows'));
+    check('no w:tblHeader', !strFromU8(unzipSync(await buildDocx(plain, margins, 'portrait'))['word/document.xml']).includes('<w:tblHeader'));
+  });
+});
+
+describe('Leg 18: per-paragraph text direction', () => {
+  const doc: N = { type: 'doc', content: [
+    P(null, T('left to right')),
+    P({ dir: 'rtl' }, T('טקסט מימין לשמאל')),
+    { type: 'table', content: [ROW(CELL(null, P({ dir: 'rtl' }, T('בתא'))))] },
+  ] };
+
+  it('ODT: style:writing-mode="rl-tb" on the block, and back', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('emitted twice (block + cell)', (content.match(/style:writing-mode="rl-tb"/g) ?? []).length === 2,
+      content.match(/style:writing-mode="[^"]*"/g));
+    const back = importOdt(bytes).content as N;
+    check('plain block stays undirected', back.content[0].attrs?.dir === undefined, back.content[0].attrs);
+    check('rtl block round-trips', back.content[1].attrs?.dir === 'rtl', back.content[1].attrs);
+    const cellPara = back.content[2].content[0].content[0].content[0];
+    check('cell paragraph round-trips', cellPara.attrs?.dir === 'rtl', cellPara.attrs);
+  });
+
+  it('DOCX: w:bidi in w:pPr, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('emitted twice (block + cell)', (xml.match(/<w:bidi\s*\/>/g) ?? []).length === 2, xml.match(/<w:bidi[^>]*>/g));
+    const back = importDocx(bytes).content as N;
+    check('plain block stays undirected', back.content[0].attrs?.dir === undefined, back.content[0].attrs);
+    check('rtl block round-trips', back.content[1].attrs?.dir === 'rtl', back.content[1].attrs);
+  });
+
+  it('an undirected document writes no writing mode at all', async () => {
+    const plain: N = { type: 'doc', content: [P(null, T('plain'))] };
+    const content = strFromU8(unzipSync(await buildOdt(plain, margins, 'portrait'))['content.xml']);
+    check('no ODF writing mode', !content.includes('style:writing-mode'), content.match(/style:writing-mode="[^"]*"/g));
+    check('no w:bidi', !strFromU8(unzipSync(await buildDocx(plain, margins, 'portrait'))['word/document.xml']).includes('<w:bidi'));
+  });
+});
+
+describe('Leg 19: captions (a sequence field per category)', () => {
+  const SEQ = (category: string, number: number): N =>
+    ({ type: 'sequenceField', attrs: { category, format: '1', number } });
+  const CAP = (category: string, label: string, n: number, text: string, box?: N): N =>
+    P({ styleName: 'Caption', ...box }, T(`${label} `), SEQ(category, n), T(`: ${text}`));
+  // The box a caption under a centred picture gets (caption.ts): as wide as the frame,
+  // centred in it. All three have to travel, or the caption drifts back to the margin.
+  const BOX = { textAlign: 'center', indent: 4.2, indentRight: 4.2 };
+  const doc: N = { type: 'doc', content: [
+    CAP('figure', 'Figure', 1, 'first picture', BOX),
+    CAP('table', 'Table', 1, 'first table'),
+    CAP('figure', 'Figure', 2, 'second picture'),
+  ] };
+
+  it('ODT: <text:sequence> per category, declared and counting', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('both counters declared', content.includes('text:name="Illustration"/>')
+      && content.includes('text:name="Table"/>'), content.match(/<text:sequence-decl[^>]*>/g));
+    check('LibreOffice’s own formula', (content.match(/text:formula="ooow:Illustration\+1"/g) ?? []).length === 2,
+      content.match(/text:formula="[^"]*"/g));
+    const back = importOdt(bytes).content as N;
+    const fields = back.content.map((p: N) => p.content?.find((c: N) => c.type === 'sequenceField'));
+    check('categories round-trip', fields.map((f: N) => f?.attrs?.category).join() === 'figure,table,figure',
+      fields.map((f: N) => f?.attrs));
+    check('numbers round-trip', fields.map((f: N) => f?.attrs?.number).join() === '1,1,2',
+      fields.map((f: N) => f?.attrs?.number));
+    check('caption style kept', back.content[0].attrs?.styleName === 'Caption', back.content[0].attrs);
+    check('the picture’s box kept', back.content[0].attrs?.textAlign === 'center'
+      && back.content[0].attrs?.indent === 4.2 && back.content[0].attrs?.indentRight === 4.2,
+      back.content[0].attrs);
+  });
+
+  it('DOCX: a SEQ field per category, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('three SEQ fields', (xml.match(/SEQ (Figure|Table) \\\* ARABIC/g) ?? []).length === 3,
+      xml.match(/SEQ [^"]*/g));
+    const back = importDocx(bytes).content as N;
+    const fields = back.content.map((p: N) => p.content?.find((c: N) => c.type === 'sequenceField'));
+    check('categories round-trip', fields.map((f: N) => f?.attrs?.category).join() === 'figure,table,figure',
+      fields.map((f: N) => f?.attrs));
+    check('numbers round-trip', fields.map((f: N) => f?.attrs?.number).join() === '1,1,2',
+      fields.map((f: N) => f?.attrs?.number));
+    check('the picture’s box kept', back.content[0].attrs?.textAlign === 'center'
+      && back.content[0].attrs?.indent === 4.2 && back.content[0].attrs?.indentRight === 4.2,
+      back.content[0].attrs);
+  });
+
+  it('a document without captions declares no counter', async () => {
+    const plain: N = { type: 'doc', content: [P(null, T('plain'))] };
+    const content = strFromU8(unzipSync(await buildOdt(plain, margins, 'portrait'))['content.xml']);
+    check('no sequence declared', !content.includes('text:sequence-decl'), content.slice(0, 200));
+    check('no SEQ field', !strFromU8(unzipSync(await buildDocx(plain, margins, 'portrait'))['word/document.xml']).includes('SEQ '));
+  });
+});
+
+describe('Leg 20: list of figures / list of tables', () => {
+  const idx = (index: string, ...entries: { text: string; level: number; page: number }[]): N =>
+    ({ type: 'tableOfContents', attrs: { index, title: null, maxLevel: 5, leader: '.', tabPosCm: null, entries } });
+  const doc: N = { type: 'doc', content: [
+    idx('figures', { text: 'Figure 1: a picture', level: 1, page: 1 }),
+    idx('tables', { text: 'Table 1: a table', level: 1, page: 2 }),
+    P(null, T('body')),
+  ] };
+
+  it('ODT: the two caption index families, and back', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('illustration index emitted', content.includes('<text:illustration-index '), content.slice(0, 200));
+    check('table index emitted', content.includes('<text:table-index '), content.slice(0, 200));
+    check('found by the counter name', content.includes('text:caption-sequence-name="Illustration"')
+      && content.includes('text:caption-sequence-name="Table"'),
+      content.match(/text:caption-sequence-name="[^"]*"/g));
+    const back = importOdt(bytes).content as N;
+    check('kinds round-trip', back.content.slice(0, 2).map((n: N) => n.attrs?.index).join() === 'figures,tables',
+      back.content.map((n: N) => [n.type, n.attrs?.index]));
+    check('entries survive', back.content[0].attrs?.entries?.[0]?.text === 'Figure 1: a picture',
+      back.content[0].attrs?.entries);
+  });
+
+  it('DOCX: a TOC field over a caption label, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    // The instruction is an XML attribute, so its quotes arrive escaped.
+    check('\\c switches emitted', /TOC[^<]*\\c\s+&quot;Figure&quot;/.test(xml) && /TOC[^<]*\\c\s+&quot;Table&quot;/.test(xml),
+      xml.match(/TOC[^<]*/g));
+    const back = importDocx(bytes).content as N;
+    const kinds = back.content.filter((n: N) => n.type === 'tableOfContents').map((n: N) => n.attrs?.index);
+    check('kinds round-trip', kinds.join() === 'figures,tables', kinds);
+  });
+
+  it('a plain table of contents is unchanged by the new families', async () => {
+    const plain: N = { type: 'doc', content: [idx('toc', { text: 'Heading', level: 1, page: 1 })] };
+    const content = strFromU8(unzipSync(await buildOdt(plain, margins, 'portrait'))['content.xml']);
+    check('still a table-of-content', content.includes('<text:table-of-content ')
+      && !content.includes('caption-sequence-name'), content.slice(0, 200));
+    check('reads back as toc', (importOdt(await buildOdt(plain, margins, 'portrait')).content as N)
+      .content[0].attrs?.index === 'toc');
+  });
+});
+
+describe('Leg 21: page background, page border and watermark', () => {
+  const decor = {
+    background: '#fff5c8',
+    border: { widthPt: 1, color: '#0046a0', paddingCm: 0.2 },
+    watermark: { text: 'ENTWURF', font: 'Liberation Sans', color: '#c8c8c8', angle: 45, transparency: 50 },
+  };
+  const doc: N = { type: 'doc', content: [P(null, T('body'))] };
+  const odt = () => buildOdt(doc, margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(),
+    1.25, 'add', false, DEFAULT_NOTE_SETTINGS, undefined, false, DEFAULT_PAGE_NUMBERING, decor);
+  const docx = () => buildDocx(doc, margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(),
+    1.25, 'add', false, DEFAULT_NOTE_SETTINGS, undefined, false, DEFAULT_PAGE_NUMBERING, decor);
+
+  it('ODT: all three on the page layout and the master page, and back', async () => {
+    const bytes = await odt();
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('background', styles.includes('fo:background-color="#fff5c8"'), styles.slice(0, 200));
+    check('border', styles.includes('fo:border="1pt solid #0046a0"') && styles.includes('fo:padding="0.2cm"'),
+      styles.match(/fo:(border|padding)="[^"]*"/g));
+    check('watermark in the header', /<style:header>[\s\S]*PowerPlusWaterMarkObject/.test(styles));
+    // The draw: prefix has to be declared or LibreOffice drops the whole shape.
+    check('draw namespace declared', styles.includes('xmlns:draw='));
+    const back = importOdt(bytes).decor;
+    check('background round-trips', back.background === '#fff5c8', back.background);
+    check('border round-trips', back.border?.widthPt === 1 && back.border?.color === '#0046a0'
+      && back.border?.paddingCm === 0.2, back.border);
+    check('watermark round-trips', back.watermark?.text === 'ENTWURF' && back.watermark?.angle === 45
+      && back.watermark?.transparency === 50, back.watermark);
+  });
+
+  it('DOCX: background, w:pgBorders and the VML shape, and back', async () => {
+    const bytes = await docx();
+    const files = unzipSync(bytes);
+    const xml = strFromU8(files['word/document.xml']);
+    check('background', xml.includes('<w:background w:color="FFF5C8"/>'), xml.slice(0, 200));
+    check('switched on', strFromU8(files['word/settings.xml']).includes('<w:displayBackgroundShape/>'));
+    // w:sectPr has a fixed child order: pgBorders belongs after pgMar, never before
+    // the header references.
+    check('border after pgMar', /<w:pgMar\b[^>]*\/><w:pgBorders/.test(xml), xml.match(/<w:sectPr[\s\S]*?<\/w:sectPr>/)?.[0]);
+    const header = Object.keys(files).find((p) => /^word\/header\d*\.xml$/.test(p));
+    check('a header part carries the shape', !!header && strFromU8(files[header]).includes('PowerPlusWaterMarkObject'), header);
+    // Word has the WordArt preset built in, LibreOffice needs the definition to travel.
+    check('shapetype travels', !!header && strFromU8(files[header]).includes('<v:shapetype id="_x0000_t136"'));
+    const back = importDocx(bytes).decor;
+    check('background round-trips', back.background === '#fff5c8', back.background);
+    check('border round-trips', back.border?.widthPt === 1 && back.border?.color === '#0046a0', back.border);
+    check('watermark round-trips', back.watermark?.text === 'ENTWURF' && back.watermark?.angle === 45,
+      back.watermark);
+  });
+
+  it('ODT: border and padding are carved out of the margins, and grown back', async () => {
+    // ODF lays the border + fo:padding inside fo:margin-*; the text area must stay
+    // at the configured margins, so the export shrinks them by 0.2cm + 1pt (0.035cm).
+    const styles = strFromU8(unzipSync(await odt())['styles.xml']);
+    check('top margin shrunk', styles.includes('fo:margin-top="2.765cm"'),
+      styles.match(/<style:page-layout-properties[^>]*/)?.[0]);
+    check('left margin shrunk', styles.includes('fo:margin-left="2.265cm"'));
+    const back = importOdt(await odt()).margins;
+    check('margins reconstructed', !!back && Math.abs(back.top - 3) < 0.01
+      && Math.abs(back.left - 2.5) < 0.01 && Math.abs(back.right - 1.5) < 0.01, back);
+  });
+
+  it('an undecorated document writes none of it', async () => {
+    const styles = strFromU8(unzipSync(await buildOdt(doc, margins, 'portrait'))['styles.xml']);
+    check('no page background', !styles.includes('fo:background-color'), styles.match(/fo:background-color="[^"]*"/g));
+    check('no watermark', !styles.includes('PowerPlusWaterMarkObject'));
+    const files = unzipSync(await buildDocx(doc, margins, 'portrait'));
+    check('no w:background', !strFromU8(files['word/document.xml']).includes('<w:background'));
+    check('no w:pgBorders', !strFromU8(files['word/document.xml']).includes('<w:pgBorders'));
+    check('no header part minted', !Object.keys(files).some((p) => /^word\/header\d*\.xml$/.test(p)),
+      Object.keys(files));
+  });
+});
+
+describe('Leg 22: line numbering', () => {
+  const ln = { on: true, interval: 5, distanceCm: 0.5, restart: 'page' as const, countEmpty: false };
+  const doc: N = { type: 'doc', content: [P(null, T('body'))] };
+
+  it('ODT: one configuration element in office:styles, and back', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(),
+      1.25, 'add', false, DEFAULT_NOTE_SETTINGS, undefined, false, DEFAULT_PAGE_NUMBERING, undefined, ln);
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('emitted once', (styles.match(/<text:linenumbering-configuration/g) ?? []).length === 1,
+      styles.match(/<text:linenumbering-configuration[^>]*>/g));
+    check('every value written', /text:increment="5"/.test(styles) && /text:offset="0.5cm"/.test(styles)
+      && /text:restart-on-page="true"/.test(styles) && /text:count-empty-lines="false"/.test(styles),
+      styles.match(/<text:linenumbering-configuration[^>]*>/g));
+    const back = importOdt(bytes).lineNumbering;
+    check('round-trips', back.on && back.interval === 5 && back.distanceCm === 0.5
+      && back.restart === 'page' && back.countEmpty === false, back);
+  });
+
+  it('DOCX: w:lnNumType in the section, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait', undefined, null, 'A4', builtinStyleSheet(),
+      1.25, 'add', false, DEFAULT_NOTE_SETTINGS, undefined, false, DEFAULT_PAGE_NUMBERING, undefined, ln);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('emitted', /<w:lnNumType[^>]*w:countBy="5"[^>]*\/>/.test(xml), xml.match(/<w:lnNumType[^>]*>/g));
+    check('restarts per page', /w:restart="newPage"/.test(xml), xml.match(/<w:lnNumType[^>]*>/g));
+    const back = importDocx(bytes).lineNumbering;
+    // Word has no "count empty lines" switch, so it comes back at its own default.
+    check('round-trips', back.on && back.interval === 5 && back.restart === 'page'
+      && Math.abs(back.distanceCm - 0.5) < 0.02, back);
+  });
+
+  it('an unnumbered document writes nothing', async () => {
+    const styles = strFromU8(unzipSync(await buildOdt(doc, margins, 'portrait'))['styles.xml']);
+    check('no ODF configuration', !styles.includes('linenumbering-configuration'));
+    check('no w:lnNumType', !strFromU8(unzipSync(await buildDocx(doc, margins, 'portrait'))['word/document.xml']).includes('<w:lnNumType'));
+  });
+});
+
+describe('Leg 23: recorded revisions', () => {
+  const rev = (type: string, id: string): N =>
+    ({ type, attrs: { id, author: 'Steffen', date: '2026-08-14T06:57:08.000Z' } });
+  const doc: N = { type: 'doc', content: [P(null,
+    T('Der '),
+    T('NEUER TEXT ', rev('insertion', 'r1')),
+    T('unveraenderte S'),
+    T('atz bleib', rev('deletion', 'r2')),
+    T('t stehen.'),
+  )] };
+  const runs = (back: N) => back.content[0].content.map(
+    (r: N) => `${r.text}|${(r.marks ?? []).map((m: N) => m.type).join(',')}`).join(' ');
+
+  it('ODT: the registry plus change-start/-end and a deletion marker, and back', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    // The registry carries whether recording goes on; this document has changes but
+    // records no more, which is the pair LibreOffice writes for a stopped review.
+    check('registry emitted', /<text:tracked-changes text:track-changes="false"><text:changed-region/.test(content),
+      content.slice(0, 200));
+    check('insertion bracketed', /<text:change-start text:change-id="ct1"\/>NEUER TEXT <text:change-end/.test(content),
+      content.match(/<text:p[^>]*>[\s\S]*?<\/text:p>/g)?.slice(-1));
+    // ODF keeps a deletion's text in the registry, never inline.
+    check('deletion lifted out', content.includes('<text:change text:change-id="ct2"/>')
+      && !/<text:p text:style-name="Standard">Der [\s\S]*?atz bleib/.test(content),
+      content.match(/<text:deletion>[\s\S]*?<\/text:deletion>/)?.[0]);
+    // dc:creator needs its prefix declared or LibreOffice drops the change-info.
+    check('dc namespace declared', content.includes('xmlns:dc='));
+    check('round-trips', runs(importOdt(bytes).content as N)
+      === 'Der | NEUER TEXT |insertion unveraenderte S| atz bleib|deletion t stehen.|',
+      runs(importOdt(bytes).content as N));
+  });
+
+  it('DOCX: w:ins and w:del/w:delText, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('w:ins emitted', /<w:ins [^>]*w:author="Steffen"/.test(xml), xml.match(/<w:ins [^>]*>/g));
+    check('w:del keeps its text', xml.includes('<w:delText') && xml.includes('atz bleib'),
+      xml.match(/<w:del [\s\S]*?<\/w:del>/)?.[0]);
+    check('round-trips', runs(importDocx(bytes).content as N)
+      === 'Der | NEUER TEXT |insertion unveraenderte S| atz bleib|deletion t stehen.|',
+      runs(importDocx(bytes).content as N));
+  });
+
+  it('a document with no revisions writes no registry', async () => {
+    const plain: N = { type: 'doc', content: [P(null, T('plain'))] };
+    check('no ODF registry', !strFromU8(unzipSync(await buildOdt(plain, margins, 'portrait'))['content.xml']).includes('tracked-changes'));
+    const xml = strFromU8(unzipSync(await buildDocx(plain, margins, 'portrait'))['word/document.xml']);
+    check('no w:ins/w:del', !xml.includes('<w:ins ') && !xml.includes('<w:del '));
+  });
+});
+
+describe('Leg 24: preset shapes beyond rect / round-rect / ellipse', () => {
+  const shape = (kind: string, text: string): N =>
+    PBX({ width: 200, height: 120, shapeKind: kind }, P(null, T(text)));
+  const doc: N = { type: 'doc', content: [
+    shape('triangle', 'tri'), shape('star5', 'star'), shape('rightArrow', 'arrow'),
+  ] };
+  const kinds = (back: N) => boxesIn(back.content).map((n: N) => n.attrs?.shapeKind).join(',');
+
+  it('ODT: each preset gets its draw:type, its own path and its text area', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    for (const type of ['isosceles-triangle', 'star5', 'right-arrow']) {
+      check(`draw:type="${type}"`, xml.includes(`draw:type="${type}"`), xml.match(/draw:type="[^"]*"/g));
+    }
+    check('the triangle carries its own path', xml.includes('draw:enhanced-path="M 10800 0 L 21600 21600 0 21600 Z N"'),
+      xml.match(/draw:enhanced-path="[^"]*"/g));
+    check('a text area travels', xml.includes('draw:text-areas="5400 10800 16200 21600"'));
+    check('round-trips', kinds(importOdt(bytes)) === 'triangle,star5,rightArrow', kinds(importOdt(bytes)));
+  });
+
+  it('DOCX: each preset gets its prstGeom, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    for (const prst of ['triangle', 'star5', 'rightArrow']) {
+      check(`prst="${prst}"`, xml.includes(`<a:prstGeom prst="${prst}">`), xml.match(/prst="[^"]*"/g));
+    }
+    check('round-trips', kinds(importDocx(bytes)) === 'triangle,star5,rightArrow', kinds(importDocx(bytes)));
+  });
+});
+
+describe('Leg 25: alphabetical index', () => {
+  const mark = (term: string, key1 = ''): N => ({ type: 'indexEntry', attrs: { term, key1 } });
+  const doc: N = { type: 'doc', content: [
+    P(null, T('Der '), mark('Kaffee'), T('Kaffee kommt aus Äthiopien.')),
+    P(null, T('Auch '), mark('Bohne', 'Kaffee'), T('die Bohne.')),
+    P(null, T('Und wieder '), mark('Kaffee'), T('Kaffee.')),
+    { type: 'tableOfContents', attrs: {
+      index: 'alphabetical', title: 'Index', leader: '.',
+      entries: [
+        { text: 'Kaffee', level: 1, page: 1, pages: [1, 2] },
+        { text: 'Kaffee: Bohne', level: 1, page: 1 },
+      ],
+    } },
+  ] };
+  const terms = (back: N) => {
+    const out: string[] = [];
+    const walk = (n: N): void => {
+      if (n?.type === 'indexEntry') out.push(`${n.attrs.key1 ? `${n.attrs.key1}:` : ''}${n.attrs.term}`);
+      (n?.content ?? []).forEach(walk);
+    };
+    walk(back.content);
+    return out.join(' ');
+  };
+  const indexKind = (back: N) => (back.content.content ?? [])
+    .find((n: N) => n.type === 'tableOfContents')?.attrs?.index;
+
+  it('ODT: point marks plus a text:alphabetical-index, and back', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('mark emitted', xml.includes('<text:alphabetical-index-mark text:string-value="Kaffee"/>'),
+      xml.match(/<text:alphabetical-index-mark[^>]*>/g));
+    check('a key files the term under it', xml.includes('text:string-value="Bohne" text:key1="Kaffee"'),
+      xml.match(/<text:alphabetical-index-mark[^>]*>/g));
+    check('index element emitted', xml.includes('<text:alphabetical-index ') || xml.includes('<text:alphabetical-index>'),
+      xml.match(/<text:alphabetical-index[^>]*>/g));
+    check('source merges repeated entries', xml.includes('text:combine-entries="true"'));
+    check('the row keeps every page it was marked on', xml.includes('<text:tab/>1, 2</text:p>'),
+      xml.match(/<text:index-body>[\s\S]*?<\/text:index-body>/)?.[0]);
+    const back = importOdt(bytes);
+    check('no warnings on own export', back.warnings.length === 0, back.warnings);
+    check('marks round-trip', terms(back as N) === 'Kaffee Kaffee:Bohne Kaffee', terms(back as N));
+    check('index round-trips as alphabetical', indexKind(back) === 'alphabetical', indexKind(back));
+  });
+
+  it('DOCX: XE fields plus an INDEX field, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('XE emitted', xml.includes('XE &quot;Kaffee&quot;'), xml.match(/w:instr="[^"]*XE[^"]*"/g));
+    check('a key rides the term', xml.includes('XE &quot;Kaffee:Bohne&quot;'), xml.match(/w:instr="[^"]*XE[^"]*"/g));
+    check('INDEX field emitted', /<w:instrText[^>]*>\s*INDEX\b/.test(xml), xml.match(/<w:instrText[^>]*>[^<]*/g));
+
+    const back = importDocx(bytes);
+    check('marks round-trip', terms(back as N) === 'Kaffee Kaffee:Bohne Kaffee', terms(back as N));
+    check('index round-trips as alphabetical', indexKind(back) === 'alphabetical', indexKind(back));
+  });
+});
+
+describe('Leg 26: bibliography', () => {
+  const cite = (identifier: string, type: string, fields: Record<string, string>): N =>
+    ({ type: 'bibliographyEntry', attrs: { identifier, type, fields, text: '' } });
+  const KAF = { author: 'Kafka, Franz', title: 'Der Process', year: '1925', publisher: 'Kurt Wolff' };
+  const MEY = { author: 'Meyer, Anna', title: 'Zur Sache', year: '1999', journal: 'Zeitschrift' };
+  const doc: N = { type: 'doc', content: [
+    P(null, T('Ein Satz mit Beleg '), cite('KAF01', 'book', KAF), T('.')),
+    P(null, T('Und noch einer '), cite('MEY99', 'article', MEY), T(', wieder '), cite('KAF01', 'book', KAF), T('.')),
+    { type: 'tableOfContents', attrs: {
+      index: 'bibliography', title: 'Literaturverzeichnis',
+      entries: [
+        { text: 'KAF01: Kafka, Franz, Der Process, 1925', level: 1, page: 1 },
+        { text: 'MEY99: Meyer, Anna, Zur Sache, 1999', level: 1, page: 1 },
+      ],
+    } },
+  ] };
+  const cites = (back: N) => {
+    const out: string[] = [];
+    const walk = (n: N): void => {
+      if (n?.type === 'bibliographyEntry') out.push(`${n.attrs.identifier}/${n.attrs.type}/${n.attrs.fields?.author ?? ''}`);
+      (n?.content ?? []).forEach(walk);
+    };
+    walk(back);
+    return out.join(' ');
+  };
+  const indexKind = (back: N) => (back.content.content ?? [])
+    .find((n: N) => n.type === 'tableOfContents')?.attrs?.index;
+  const WANT = 'KAF01/book/Kafka, Franz MEY99/article/Meyer, Anna KAF01/book/Kafka, Franz';
+
+  it('ODT: bibliography marks plus a text:bibliography, and back', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait');
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('mark carries its whole record',
+      xml.includes('<text:bibliography-mark text:identifier="KAF01" text:bibliography-type="book"')
+      && xml.includes('text:author="Kafka, Franz"') && xml.includes('text:year="1925"'),
+      xml.match(/<text:bibliography-mark[^>]*>/g));
+    check('the mark wraps the text the citation shows', xml.includes('>[KAF01]</text:bibliography-mark>'),
+      xml.match(/<text:bibliography-mark[\s\S]{0,200}?<\/text:bibliography-mark>/g));
+    check('index element emitted', xml.includes('<text:bibliography '), xml.match(/<text:bibliography[^>-][^>]*>/g));
+    check('a template per type cited',
+      xml.includes('text:bibliography-type="book" text:style-name="Bibliography_20_1"')
+      && xml.includes('text:bibliography-type="article" text:style-name="Bibliography_20_1"'),
+      xml.match(/<text:bibliography-entry-template[^>]*>/g));
+    check('a row has no tab and no page number',
+      xml.includes('>KAF01: Kafka, Franz, Der Process, 1925</text:p>'),
+      xml.match(/<text:index-body>[\s\S]*?<\/text:index-body>/)?.[0]);
+
+    const back = importOdt(bytes);
+    check('no warnings on own export', back.warnings.length === 0, back.warnings);
+    check('citations round-trip', cites(back.content as N) === WANT, cites(back.content as N));
+    check('index round-trips as a bibliography', indexKind(back) === 'bibliography', indexKind(back));
+  });
+
+  it('DOCX: CITATION fields over a custom-XML source, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait');
+    const files = unzipSync(bytes);
+    const xml = strFromU8(files['word/document.xml']);
+    check('CITATION emitted', xml.includes('w:instr="CITATION &quot;KAF01&quot;"'), xml.match(/w:instr="[^"]*"/g));
+    check('BIBLIOGRAPHY field emitted', /<w:instrText[^>]*>\s*BIBLIOGRAPHY\b/.test(xml), xml.match(/<w:instrText[^>]*>[^<]*/g));
+
+    const item = files['customXml/item1.xml'] ? strFromU8(files['customXml/item1.xml']) : '';
+    check('one source per tag, not per citation', (item.match(/<b:Source>/g) ?? []).length === 2,
+      item.match(/<b:Tag>[^<]*<\/b:Tag>/g));
+    check('the author splits into Word’s name list',
+      item.includes('<b:Last>Kafka</b:Last><b:First>Franz</b:First>'), item.slice(0, 600));
+    check('the type maps onto Word’s', item.includes('<b:SourceType>Book</b:SourceType>')
+      && item.includes('<b:SourceType>JournalArticle</b:SourceType>'), item.match(/<b:SourceType>[^<]*</g));
+    check('the part is declared', !!files['customXml/itemProps1.xml']
+      && !!files['customXml/_rels/item1.xml.rels'], Object.keys(files).filter(k => k.startsWith('customXml')));
+    check('the document relates to it',
+      strFromU8(files['word/_rels/document.xml.rels']).includes('../customXml/item1.xml'));
+    check('its properties part has a content type',
+      strFromU8(files['[Content_Types].xml']).includes('/customXml/itemProps1.xml'));
+
+    const back = importDocx(bytes);
+    check('citations round-trip', cites(back.content as N) === WANT, cites(back.content as N));
+    check('index round-trips as a bibliography', indexKind(back) === 'bibliography', indexKind(back));
+  });
+});
+
+describe('Leg 27: per-section page size and orientation (ODT + DOCX)', () => {
+  const secDoc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('portrait section')),
+      P({ sectionBreak: true, breakBefore: 'page' }, T('the wide table lives here')),
+      P({ sectionBreak: true, breakBefore: 'page' }, T('portrait again')),
+    ],
+  };
+  // The common case: one landscape page amid portrait ones, plus a section on
+  // another paper entirely.
+  const sections = [
+    { ...EMPTY_HF_SET },
+    { ...EMPTY_HF_SET, orientation: 'landscape' as const },
+    { ...EMPTY_HF_SET, format: 'A5' as const },
+  ];
+  const paperOf = (res: N, i: number) =>
+    `${res.hfSections?.[i]?.format ?? '-'}/${res.hfSections?.[i]?.orientation ?? '-'}`;
+
+  it('ODT: each section gets its own page layout', async () => {
+    const bytes = await buildOdt(secDoc, margins, 'portrait', { sections, pageCount: 3 });
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    const layoutOf = (n: number) => {
+      const name = new RegExp(`<style:master-page style:name="Section${n}" style:page-layout-name="([^"]*)"`).exec(styles)?.[1];
+      return name ? new RegExp(`<style:page-layout\\b[^>]*style:name="${name}"[\\s\\S]*?<style:page-layout-properties\\b[^>]*>`).exec(styles)?.[0] ?? '' : '';
+    };
+    check('the landscape section swaps the page box',
+      /fo:page-width="29.7cm"/.test(layoutOf(2)) && /fo:page-height="21cm"/.test(layoutOf(2)), layoutOf(2));
+    check('and says so on the layout', /style:print-orientation="landscape"/.test(layoutOf(2)), layoutOf(2));
+    check('the A5 section takes A5', /fo:page-width="14.8cm"/.test(layoutOf(3)) && /fo:page-height="21cm"/.test(layoutOf(3)), layoutOf(3));
+
+    const res = importOdt(bytes);
+    check('the document keeps its own paper', `${res.format}/${res.orientation}` === 'A4/portrait', `${res.format}/${res.orientation}`);
+    check('the landscape section round-trips', paperOf(res, 1) === '-/landscape', paperOf(res, 1));
+    check('the A5 section round-trips', paperOf(res, 2) === 'A5/-', paperOf(res, 2));
+  });
+
+  it('DOCX: each sectPr carries its own w:pgSz', async () => {
+    const bytes = await buildDocx(secDoc, margins, 'portrait', { sections, pageCount: 3 });
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    const sizes = xml.match(/<w:pgSz[^>]*>/g) ?? [];
+    check('three sections, three page boxes', sizes.length === 3, sizes);
+    check('the middle one is landscape', /w:orient="landscape"/.test(sizes[1] ?? '') && /w:w="16838"/.test(sizes[1] ?? ''), sizes[1]);
+    check('the last one is A5', /w:w="839[12]"/.test(sizes[2] ?? ''), sizes[2]);
+
+    const res = importDocx(bytes);
+    check('the document keeps its own paper', `${res.format}/${res.orientation}` === 'A4/portrait', `${res.format}/${res.orientation}`);
+    check('the landscape section round-trips', paperOf(res, 1) === '-/landscape', paperOf(res, 1));
+    check('the A5 section round-trips', paperOf(res, 2) === 'A5/-', paperOf(res, 2));
+  });
+});
+
+describe('Leg 29: lines and arrows (ODT + DOCX)', () => {
+  const line = (kind: string, flipV = false): N => ({
+    type: 'textBox',
+    // strokeColor as the schema defaults it: a line with no pen is invisible, and
+    // both exports then write it as one.
+    attrs: { width: 200, height: 60, shapeKind: kind, strokeColor: '#000000', ...(flipV ? { flipV: true } : {}) },
+    content: [P(null)],
+  });
+  const doc: N = { type: 'doc', content: [P(null, T('above')), P(null, line('lineArrow', true)), P(null, T('below'))] };
+  const boxOf = (res: N): N => boxesIn(res.content)[0];
+
+  it('ODT: a line is two endpoints, not a frame', async () => {
+    const bytes = await buildOdt(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    const el = /<draw:line\b[^>]*\/>/.exec(xml)?.[0] ?? '';
+    check('the flipped line runs bottom-left to top-right', /svg:y1="[^0][^"]*cm" svg:x2="[^"]*" svg:y2="0cm"/.test(el), el);
+    const style = /<style:style style:name="TbxFr1"[\s\S]*?\/><\/style:style>/.exec(xml)?.[0] ?? '';
+    check('and carries the arrow head at its end', /draw:marker-end="Arrow"/.test(style), style);
+    check('but not at its start', !/draw:marker-start=/.test(style), style);
+    check('the marker itself is defined once', /<draw:marker draw:name="Arrow"/.test(strFromU8(unzipSync(bytes)['styles.xml'])), 'styles.xml');
+
+    const res = importOdt(bytes);
+    check('no warnings — the line is not dropped', res.warnings.length === 0, res.warnings);
+    check('it comes back as an arrow', boxOf(res)?.attrs?.shapeKind === 'lineArrow', boxOf(res)?.attrs);
+    check('on the same diagonal', boxOf(res)?.attrs?.flipV === true, boxOf(res)?.attrs);
+  });
+
+  it('DOCX: a line is the preset Word flips across the frame', async () => {
+    const bytes = await buildDocx(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('the frame is flipped, not the geometry', /<a:xfrm flipV="1">/.test(xml), xml.slice(xml.indexOf('<a:xfrm'), xml.indexOf('<a:xfrm') + 80));
+    check('one head, at the tail', /<a:tailEnd type="triangle"\/>/.test(xml) && !/<a:headEnd/.test(xml), 'a:ln');
+    check('and no text body on it', !/<wps:txbx>/.test(xml), 'wps:txbx');
+
+    const res = importDocx(bytes);
+    check('it comes back as an arrow', boxOf(res)?.attrs?.shapeKind === 'lineArrow', boxOf(res)?.attrs);
+    check('on the same diagonal', boxOf(res)?.attrs?.flipV === true, boxOf(res)?.attrs);
+  });
+});
+
+describe('Leg 28: a cell formula (ODT + DOCX)', () => {
+  // A1..A3 hold the numbers, A4 sums them the way Word names the range.
+  const num = (text: string): N => ({ type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: [100] }, content: [P(null, T(text))] });
+  const sum: N = {
+    type: 'tableCell',
+    attrs: { colspan: 1, rowspan: 1, colwidth: [100], formula: 'SUM(ABOVE)' },
+    content: [P(null, T('19.5'))],
+  };
+  const doc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('before')),
+      { type: 'table', content: [ROW(num('10')), ROW(num('2.5')), ROW(num('7')), ROW(sum)] },
+      P(null, T('after')),
+    ],
+  };
+  const formulaOf = (res: N): unknown =>
+    (res.content.content ?? []).find((n: N) => n.type === 'table')?.content?.[3]?.content?.[0]?.attrs?.formula;
+
+  it('ODT: the formula rides the cell, in LibreOffice\'s own language', async () => {
+    const bytes = await buildOdt(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    const cell = /<table:table-cell[^>]*table:formula="[^"]*"[^>]*>/.exec(xml)?.[0] ?? '';
+    check('ABOVE is resolved to the range it stands for', /table:formula="ooow:sum &lt;A1:A3&gt;"/.test(cell), cell);
+    check('and the result is cached as the cell value', /office:value-type="float" office:value="19.5"/.test(cell), cell);
+
+    const res = importOdt(bytes);
+    check('it comes back as the stored formula', formulaOf(res) === 'SUM(A1:A3)', formulaOf(res));
+  });
+
+  it('DOCX: the cell holds a formula field', async () => {
+    const bytes = await buildDocx(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    const field = /<w:fldSimple[^>]*w:instr="[^"]*=[^"]*"[^>]*>[\s\S]*?<\/w:fldSimple>/.exec(xml)?.[0] ?? '';
+    check('the field is the formula Word reads', /w:instr="\s*=SUM\(ABOVE\)\s*"/.test(field), field);
+    check('with the result cached in it', />19\.5</.test(field), field);
+
+    const res = importDocx(bytes);
+    check('it comes back as the stored formula', formulaOf(res) === 'SUM(ABOVE)', formulaOf(res));
+  });
+});
+
+// A picture and its caption in one frame — LibreOffice's own arrangement for a
+// captioned figure, and what a caption that stays with its picture would build.
+describe('Leg 30: a figure frame (picture + caption in one box)', () => {
+  const SEQ: N = { type: 'sequenceField', attrs: { category: 'figure', format: '1', number: 1 } };
+  const frame = PBX(
+    { width: 240, height: 190, wrap: 'topBottom', wrapAlign: 'center', fillColor: null, strokeColor: null },
+    P(null, IMGN(240, 160, 'pic')),
+    P({ styleName: 'Caption' }, T('Figure '), SEQ, T(': framed')),
+  );
+  const doc: N = { type: 'doc', content: [P(null, T('body')), frame] };
+  const boxOf = (res: N): N => boxesIn(res.content)[0];
+  const shapeOf = (box: N): string =>
+    (box?.content ?? []).map((b: N) => (b.content ?? []).map((c: N) => c.type).join('+')).join('|');
+
+  it('ODT: the picture rides inside the box, caption and counter with it', async () => {
+    const bytes = await buildOdt(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    const box = xml.match(/<draw:text-box[\s\S]*?<\/draw:text-box>/)?.[0] ?? '';
+    check('the picture is inside the text box', box.includes('<draw:image'), box.slice(0, 200));
+    check('so is the counter', box.includes('text:name="Illustration"'), box.slice(0, 400));
+    const back = boxOf(importOdt(bytes));
+    check('box comes back whole', shapeOf(back) === 'image|text+sequenceField+text', shapeOf(back));
+  });
+
+  it('DOCX: the drawing inside the box does not swallow it', async () => {
+    const bytes = await buildDocx(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    const box = xml.match(/<w:txbxContent>[\s\S]*?<\/w:txbxContent>/)?.[0] ?? '';
+    check('the picture is inside the box', box.includes('<w:drawing>'), box.slice(0, 200));
+    check('the counter stays a field', box.includes('SEQ Figure'), box.slice(0, 600));
+    // A nested drawing's own wp:inline used to be read as the outer one's root, which
+    // dropped the box and every word of the caption.
+    const back = boxOf(importDocx(bytes));
+    check('box comes back whole', shapeOf(back) === 'image|text+sequenceField+text', shapeOf(back));
+  });
+});
+
+describe('Leg 31: placeholder fields (ODT + DOCX)', () => {
+  const PLF = (text: string, marks?: N[]): N =>
+    ({ type: 'placeholderField', attrs: { text }, ...(marks ? { marks } : {}) });
+  const BOLD = { type: 'bold' };
+  const doc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('Sehr geehrte '), PLF('Empfängername'), T(',')),
+      P(null, PLF('Betreff & <Zeichen>', [BOLD])),
+    ],
+  };
+  const fieldsOf = (res: N): N[] => {
+    const out: N[] = [];
+    (function walk(n: N) { if (n.type === 'placeholderField') out.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    return out;
+  };
+
+  it('ODT: exports <text:placeholder> and re-imports label + marks', async () => {
+    const bytes = await buildOdt(doc, margins);
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('emits text:placeholder', content.includes('<text:placeholder text:placeholder-type="text">'), content.slice(0, 200));
+    check('label carries LibreOffice-style brackets', content.includes('&lt;Empfängername&gt;'));
+    check('no leftover sentinel', !content.includes(''));
+    const fields = fieldsOf(importOdt(bytes));
+    check('both fields imported', fields.length === 2, fields);
+    check('label round-trips', fields[0]?.attrs?.text === 'Empfängername', fields[0]?.attrs);
+    check('special characters survive', fields[1]?.attrs?.text === 'Betreff & <Zeichen>', fields[1]?.attrs);
+    check('bold mark survives', (fields[1]?.marks ?? []).some((m: N) => m.type === 'bold'), fields[1]?.marks);
+  });
+
+  it('DOCX: exports a tagged <w:sdt> and re-imports it as a field', async () => {
+    const bytes = await buildDocx(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('emits a content control', xml.includes('<w:sdt>'), xml.slice(0, 200));
+    check('tagged as ours', xml.includes('w:tag w:val="edentext-placeholder"'));
+    check('gray placeholder color', xml.includes('<w:color w:val="808080"/>'));
+    check('no leftover sentinel', !xml.includes(''));
+    const fields = fieldsOf(importDocx(bytes));
+    check('both fields imported', fields.length === 2, fields);
+    check('label round-trips', fields[0]?.attrs?.text === 'Empfängername', fields[0]?.attrs);
+    check('special characters survive', fields[1]?.attrs?.text === 'Betreff & <Zeichen>', fields[1]?.attrs);
+    check('bold mark survives', (fields[1]?.marks ?? []).some((m: N) => m.type === 'bold'), fields[1]?.marks);
+    check('the gray does not come back as a color mark',
+      !fields.some((f) => (f.marks ?? []).some((m: N) => m.type === 'textStyle' && m.attrs?.color)), fields);
+  });
+});
+
+describe('Leg 32: fold marks (ODT + DOCX)', () => {
+  const doc: N = { type: 'doc', content: [P(null, T('Brieftext'))] };
+  const commonTail = [undefined, undefined, 'A4', builtinStyleSheet(), 1.25, 'add', false,
+    DEFAULT_NOTE_SETTINGS, EMPTY_DOC_PROPERTIES, false, DEFAULT_PAGE_NUMBERING,
+    EMPTY_PAGE_DECOR, DEFAULT_LINE_NUMBERING, false, true] as const;
+
+  it('ODT: named header lines carry the flag both ways', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait', ...commonTail);
+    const styles = strFromU8(unzipSync(bytes)['styles.xml']);
+    check('five named lines in the header (folds both edges + punch)', (styles.match(new RegExp(FOLD_MARK_NAME, 'g')) ?? []).length === 5, styles.slice(0, 200));
+    check('a right-edge fold mark', styles.includes(`${FOLD_MARK_NAME}1R`));
+    check('page-relative position', styles.includes('style:vertical-rel="page"'));
+    const res = importOdt(bytes);
+    check('flag comes back', res.foldMarks === true);
+    check('no shape leaks into the header zone', res.header === null, res.header);
+    check('no warning for the dropped lines', res.warnings.length === 0, res.warnings);
+    // Off exports nothing and imports off.
+    const plain = await buildOdt(doc, margins, 'portrait');
+    check('off writes no lines', !strFromU8(unzipSync(plain)['styles.xml']).includes(FOLD_MARK_NAME));
+    check('off imports off', importOdt(plain).foldMarks === false);
+  });
+
+  it('DOCX: named VML lines carry the flag both ways', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait', ...commonTail);
+    const files = unzipSync(bytes);
+    const headers = Object.keys(files).filter((p) => /^word\/header\d*\.xml$/.test(p));
+    check('a header part exists for the lines', headers.length > 0, Object.keys(files));
+    check('the lines ride a header', headers.some((p) => strFromU8(files[p]).includes(FOLD_MARK_NAME)));
+    check('a right-edge fold mark', headers.some((p) => strFromU8(files[p]).includes(`${FOLD_MARK_NAME}1R`)));
+    const res = importDocx(bytes);
+    check('flag comes back', res.foldMarks === true);
+    check('no shape leaks into the header zone', res.header === null, res.header);
+    check('no warning for the dropped lines', res.warnings.length === 0, res.warnings);
+    const plain = await buildDocx(doc, margins, 'portrait');
+    check('off imports off', importDocx(plain).foldMarks === false);
+  });
+});
+
+describe('Leg 33: where a box sits across the column (ODT + DOCX)', () => {
+  // A box in the line is a character: the paragraph it sits in aligns it, and that is
+  // what both formats write (fo:text-align / w:jc). A band-wrapped box has a place of
+  // its own across the column instead, which is what wrapAlign is.
+  const inlineDoc = (align: string | null): N => ({
+    type: 'doc',
+    content: [
+      P(null, T('above')),
+      P(align ? { textAlign: align } : null, TBX({ width: 200, height: 90 }, P(null, T('Kasten')))),
+      P(null, T('below')),
+    ],
+  });
+  const bandDoc = (wrapAlign: string | null): N => ({
+    type: 'doc',
+    content: [
+      P(null, T('above')),
+      PBX({ width: 200, height: 90, wrap: 'topBottom', ...(wrapAlign ? { wrapAlign } : {}) }, P(null, T('Kasten'))),
+      P(null, T('below')),
+    ],
+  });
+  const alignOf = (res: N): unknown => boxesIn(res.content)[0]?.attrs?.wrapAlign ?? null;
+  const paraAlignOf = (res: N): unknown =>
+    (res.content.content ?? []).find((n: N) => boxesIn(n).length)?.attrs?.textAlign ?? null;
+
+  for (const align of ['center', 'right', null] as const) {
+    it(`ODT: an in-line box takes its paragraph's ${align ?? 'left'} alignment`, async () => {
+      const bytes = await buildOdt(inlineDoc(align), margins);
+      check('the alignment survives', paraAlignOf(importOdt(bytes)) === align, paraAlignOf(importOdt(bytes)));
+    });
+
+    it(`DOCX: an in-line box takes its paragraph's ${align ?? 'left'} alignment`, async () => {
+      const bytes = await buildDocx(inlineDoc(align), margins);
+      check('the alignment survives', paraAlignOf(importDocx(bytes)) === align, paraAlignOf(importDocx(bytes)));
+    });
+
+    it(`ODT: a band-wrapped box keeps ${align ?? 'left'}`, async () => {
+      const bytes = await buildOdt(bandDoc(align), margins);
+      check('the alignment survives', alignOf(importOdt(bytes)) === align, alignOf(importOdt(bytes)));
+    });
+
+    it(`DOCX: a band-wrapped box keeps ${align ?? 'left'}`, async () => {
+      const bytes = await buildDocx(bandDoc(align), margins);
+      const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+      check('the band position is written', xml.includes(`<wp:align>${align ?? 'left'}</wp:align>`), /<wp:positionH[\s\S]*?<\/wp:positionH>/.exec(xml)?.[0]);
+      check('the alignment survives', alignOf(importDocx(bytes)) === align, alignOf(importDocx(bytes)));
+    });
+  }
+});
+
+describe('Leg 34: a box keeps the height it declares (DOCX)', () => {
+  const doc: N = {
+    type: 'doc',
+    content: [P(null, T('above')), PBX({ width: 200, height: 90, wrap: 'topBottom' }, P(null, T('inside'))), P(null, T('below'))],
+  };
+
+  it('the shape body does not autofit to its text', async () => {
+    const bytes = await buildDocx(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    // Read as spAutoFit, LibreOffice gives the frame min-height 0 and lays its text
+    // out detached from the shape, over whatever follows (probed).
+    check('noAutofit, as LibreOffice writes for the same frame', xml.includes('<a:noAutofit/>'), 'wps:bodyPr');
+    check('never spAutoFit', !xml.includes('<a:spAutoFit/>'), 'wps:bodyPr');
+    check('the declared height still rides the extent', xml.includes('cy="857250"'), 'wp:extent');
+  });
+});
+
+// A box is a character now, so what has to survive is its place in the run and the
+// places the old block model could not reach at all.
+describe('Leg 35: an in-line box keeps its place in the paragraph (ODT + DOCX)', () => {
+  const doc: N = {
+    type: 'doc',
+    content: [P(null, T('vor '), TBX({ width: 160, height: 60 }, P(null, T('Kasten'))), T(' nach'))],
+  };
+  // The paragraph's content types, so a box that slipped out of the run shows up.
+  const shape = (res: N): string =>
+    ((res.content.content ?? [])[0]?.content ?? []).map((n: N) => n.type).join('+');
+
+  it('ODT: an as-char frame between the two runs', async () => {
+    const bytes = await buildOdt(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('one paragraph holds text, frame and text', /<text:p[^>]*>vor <draw:frame[\s\S]*?<\/draw:frame> nach<\/text:p>/.test(xml),
+      /<text:p[^>]*>vor [\s\S]{0,120}/.exec(xml)?.[0]);
+    check('anchored as-char', xml.includes('text:anchor-type="as-char"'), 'anchor');
+    // The Frame parent hangs a frame naming no vertical position below the line.
+    check('standing on the baseline', xml.includes('style:vertical-pos="top" style:vertical-rel="baseline"'), 'TbxFr1');
+    check('it comes back between the two runs', shape(importOdt(bytes)) === 'text+textBox+text', shape(importOdt(bytes)));
+  });
+
+  it('DOCX: a wp:inline drawing between the two runs', async () => {
+    const bytes = await buildDocx(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('inline, not anchored', xml.includes('<wp:inline') && !xml.includes('<wp:anchor'), 'wp');
+    check('the surrounding runs are kept', xml.includes('vor ') && xml.includes(' nach'), 'runs');
+    check('it comes back between the two runs', shape(importDocx(bytes)) === 'text+textBox+text', shape(importDocx(bytes)));
+  });
+});
+
+describe('Leg 36: a box in a table cell (ODT + DOCX)', () => {
+  const doc: N = {
+    type: 'doc',
+    content: [
+      P(null, T('vor der Tabelle')),
+      { type: 'table', content: [ROW(
+        CELL([6], P(null, T('zelle '), TBX({ width: 120, height: 50 }, P(null, T('im Kasten'))))),
+        CELL([6], P(null, T('b'))),
+      )] },
+    ],
+  };
+  const inCell = (res: N): N => {
+    const table = (res.content.content ?? []).find((n: N) => n.type === 'table');
+    return boxesIn(table)[0];
+  };
+
+  it('ODT: the frame rides the cell paragraph', async () => {
+    const bytes = await buildOdt(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['content.xml']);
+    check('the frame is inside the cell', /<table:table-cell[\s\S]*?<draw:frame[\s\S]*?<\/table:table-cell>/.test(xml), 'cell');
+    const res = importOdt(bytes);
+    check('no warnings', res.warnings.length === 0, res.warnings);
+    check('the box survives with its text', inCell(res)?.content?.[0]?.content?.[0]?.text === 'im Kasten', inCell(res));
+  });
+
+  it('DOCX: the drawing rides the cell paragraph', async () => {
+    const bytes = await buildDocx(doc, margins);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('the drawing is inside the cell', /<w:tc>[\s\S]*?<wps:wsp[\s\S]*?<\/w:tc>/.test(xml), 'w:tc');
+    const res = importDocx(bytes);
+    check('the box survives with its text', inCell(res)?.content?.[0]?.content?.[0]?.text === 'im Kasten', inCell(res));
+  });
+});
+
+// The editor bars a box inside a box (both word processors do), so a file carrying one
+// has to arrive without it — a rejected load would drop the whole document.
+describe('Leg 37: a box inside a box is unwrapped on import (ODT)', () => {
+  it('keeps its blocks in the outer box, with a warning', () => {
+    const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0">
+ <office:body><office:text>
+  <text:p><draw:frame text:anchor-type="as-char" svg:width="8cm"><draw:text-box><text:p>aussen</text:p><text:p><draw:frame text:anchor-type="as-char" svg:width="3cm"><draw:text-box><text:p>innen</text:p></draw:text-box></draw:frame></text:p></draw:text-box></draw:frame></text:p>
+ </office:text></office:body>
+</office:document-content>`;
+    const foreign = zipSync({
+      mimetype: [strToU8('application/vnd.oasis.opendocument.text'), { level: 0 }],
+      'content.xml': [strToU8(contentXml), { level: 6 }],
+    } as any);
+    const f = importOdt(foreign);
+    const boxes = boxesIn(f.content);
+    check('only the outer box survives', boxes.length === 1, boxes.map((b: N) => b.attrs));
+    check('the inner box\'s text is kept in it',
+      JSON.stringify(boxes[0]?.content).includes('innen'), boxes[0]?.content);
+    check('and it is reported', f.warnings.some((w: string) => /nested in other text boxes/.test(w)), f.warnings);
+  });
+});
+
+describe('Leg 38: a language per paragraph and per run (ODT + DOCX)', () => {
+  const de = { language: 'de', country: 'DE' };
+  const doc: N = { type: 'doc', content: [
+    P(null, T('deutscher Fließtext')),
+    P({ lang: 'en-US' }, T('an English paragraph')),
+    P(null, T('mit einem '), T('mot français', { type: 'textStyle', attrs: { lang: 'fr-FR' } }), T(' darin')),
+    { type: 'table', content: [ROW(CELL(null, P({ lang: 'en-US' }, T('in the cell'))))] },
+  ] };
+
+  it('ODT: fo:language on the paragraph and on the run, and back', async () => {
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, de);
+    const content = strFromU8(unzipSync(bytes)['content.xml']);
+    check('English twice (block + cell)', (content.match(/fo:language="en" fo:country="US"/g) ?? []).length === 2,
+      content.match(/fo:language="[^"]*" fo:country="[^"]*"/g));
+    check('the French run', content.includes('fo:language="fr" fo:country="FR"'),
+      content.match(/fo:language="[^"]*"/g));
+
+    const back = importOdt(bytes).content as N;
+    check('the German paragraph carries none', back.content[0].attrs?.lang === undefined, back.content[0].attrs);
+    check('the English paragraph round-trips', back.content[1].attrs?.lang === 'en-US', back.content[1].attrs);
+    const run = back.content[2].content.find((c: N) => c.text === 'mot français');
+    check('the French run round-trips', run?.marks?.[0]?.attrs?.lang === 'fr-FR', run?.marks);
+    const cellPara = back.content[3].content[0].content[0].content[0];
+    check('the cell paragraph round-trips', cellPara.attrs?.lang === 'en-US', cellPara.attrs);
+  });
+
+  it('DOCX: w:lang in the run properties, and back', async () => {
+    const bytes = await buildDocx(doc, margins, 'portrait', undefined, de);
+    const xml = strFromU8(unzipSync(bytes)['word/document.xml']);
+    check('English runs carry it', (xml.match(/<w:lang w:val="en-US"\s*\/>/g) ?? []).length >= 2,
+      xml.match(/<w:lang[^>]*>/g));
+    check('the French run', xml.includes('<w:lang w:val="fr-FR"/>'), xml.match(/<w:lang[^>]*>/g));
+
+    const back = importDocx(bytes).content as N;
+    check('the German paragraph carries none', back.content[0].attrs?.lang === undefined, back.content[0].attrs);
+    check('the English paragraph round-trips', back.content[1].attrs?.lang === 'en-US', back.content[1].attrs);
+    const run = back.content[2].content.find((c: N) => c.text === 'mot français');
+    check('the French run round-trips', run?.marks?.some((m: N) => m.attrs?.lang === 'fr-FR'), run?.marks);
+    const cellPara = back.content[3].content[0].content[0].content[0];
+    check('the cell paragraph round-trips', cellPara.attrs?.lang === 'en-US', cellPara.attrs);
+  });
+
+  it('a document in one language writes no language into its paragraphs', async () => {
+    const plain: N = { type: 'doc', content: [P(null, T('nur Deutsch'))] };
+    const content = strFromU8(unzipSync(await buildOdt(plain, margins, 'portrait', undefined, de))['content.xml']);
+    check('no fo:language in content.xml', !content.includes('fo:language'), content.match(/fo:language="[^"]*"/g));
+    const xml = strFromU8(unzipSync(await buildDocx(plain, margins, 'portrait', undefined, de))['word/document.xml']);
+    check('no w:lang in document.xml', !xml.includes('<w:lang'), xml.match(/<w:lang[^>]*>/g));
+  });
+});

@@ -1,0 +1,604 @@
+// LibreOffice round-trip leg: editor JSON -> buildOdt -> `soffice --convert-to odt`
+// re-save -> importOdt -> compare. Requires soffice on PATH; the whole suite self-skips
+// when it is absent (so plain `npm test` / CI stay green).
+import { describe, it, expect } from 'vitest';
+import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { unzipSync, strFromU8 } from 'fflate';
+import { buildOdt } from '../src/lib/export/odt';
+import { importOdt } from '../src/lib/import/odt';
+import { builtinStyleSheet } from '../src/lib/styles/styleSheet';
+import { DEFAULT_OUTLINE_LEVEL } from '../src/lib/styles/outlineNumbering';
+
+type N = any;
+
+function hasSoffice(): boolean {
+  try { execSync('command -v soffice', { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+const SOFFICE = hasSoffice();
+
+function check(label: string, cond: boolean, detail?: unknown) {
+  expect.soft(cond, detail !== undefined ? `${label} — ${JSON.stringify(detail)}` : label).toBe(true);
+}
+
+const T = (text: string, ...marks: N[]): N => ({ type: 'text', text, ...(marks.length ? { marks } : {}) });
+const P = (attrs: N | null, ...content: N[]): N => ({ type: 'paragraph', ...(attrs ? { attrs } : {}), ...(content.length ? { content } : {}) });
+const LI = (...content: N[]): N => ({ type: 'listItem', content });
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNwaDgAAAKEAYEml6crAAAAAElFTkSuQmCC';
+const IMGN = (width: number, height: number, alt?: string, rotation?: number, wrap?: string): N =>
+  ({ type: 'image', attrs: {
+    src: PNG, width, height,
+    ...(alt ? { alt } : {}), ...(rotation ? { rotation } : {}), ...(wrap ? { wrap } : {}),
+  } });
+const TBX = (attrs: N, ...content: N[]): N => ({ type: 'textBox', attrs, content });
+// A box is inline, so it rides a paragraph of its own.
+const PBX = (attrs: N, ...content: N[]): N => ({ type: 'paragraph', content: [TBX(attrs, ...content)] });
+const boxesIn = (n: N, out: N[] = []): N[] => {
+  if (n?.type === 'textBox') out.push(n);
+  for (const c of n?.content ?? []) boxesIn(c, out);
+  return out;
+};
+
+const margins = { top: 3, bottom: 2, left: 2.5, right: 1.5 };
+
+const fixture: N = {
+  type: 'doc',
+  content: [
+    { type: 'heading', attrs: { level: 1, textAlign: 'center' }, content: [T('LO Round Trip')] },
+    P(null,
+      T('Plain '),
+      T('bold', { type: 'bold' }),
+      T(' italic', { type: 'italic' }),
+      T(' colored', { type: 'textStyle', attrs: { color: '#C00000' } }),
+      T(' marked', { type: 'highlight', attrs: { color: '#FFFF00' } }),
+      T(' arial14', { type: 'textStyle', attrs: { fontFamily: 'Arial', fontSize: '14pt' } }),
+    ),
+    // A language on the paragraph and on a run inside it — both are fo:language in a
+    // text-properties block, and LibreOffice must hand both back unchanged.
+    P({ lang: 'en-US' },
+      T('An English paragraph with a '),
+      T('mot français', { type: 'textStyle', attrs: { lang: 'fr-FR' } }),
+      T(' inside it'),
+    ),
+    // Character effects: LibreOffice must read back what we write for each of them.
+    P(null,
+      T('caps ', { type: 'textStyle', attrs: { caps: 'uppercase' } }),
+      T('petite ', { type: 'textStyle', attrs: { caps: 'smallCaps' } }),
+      T('dotted ', { type: 'underline', attrs: { lineStyle: 'dotted', lineColor: '#FF0000' } }),
+      T('twice ', { type: 'underline', attrs: { lineStyle: 'double' } }),
+      T('crossed ', { type: 'strike', attrs: { lineStyle: 'double' } }),
+      // 4pt at 16pt is a whole 25%, the unit ODF stores it in — LibreOffice rounds
+      // the percentage when it re-saves, so a fractional one comes back a notch off.
+      T('raised', { type: 'textStyle', attrs: { fontSize: '16pt', textPosition: 4 } }),
+    ),
+    P({ textAlign: 'justify', lineHeight: '1.5', spaceBefore: 12, spaceAfter: 18 }, T('spaced')),
+    P({ indent: 2.5 }, T('indented')),
+    P(null, T('line one'), { type: 'hardBreak' }, T('line two')),
+    P(null, T('logo: '), IMGN(100, 50, 'Logo')),
+    P(null, T('rotated: '), IMGN(120, 80, 'Rotated', 30)),
+    P(null, T('wrapped '), IMGN(90, 60, 'Float', 0, 'left'), T(' text beside it')),
+    { type: 'orderedList', attrs: { listStyleType: 'upper-roman-paren' }, content: [
+      LI(P(null, T('first'))),
+      LI(P({ textAlign: 'center' }, T('centered'))),
+    ] },
+    { type: 'bulletList', attrs: { indent: 2.5 }, content: [
+      LI(P(null, T('shifted a'))),
+      LI(P(null, T('shifted b'))),
+    ] },
+    { type: 'bulletList', content: [
+      LI(P(null, T('bullet')), { type: 'orderedList', attrs: { listStyleType: 'lower-alpha-paren' }, content: [
+        LI(P(null, T('nested alpha'))),
+      ] }),
+    ] },
+    { type: 'table', content: [
+      { type: 'tableRow', attrs: { rowHeight: 60 }, content: [
+        { type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: [120] }, content: [
+          { type: 'heading', attrs: { level: 3 }, content: [T('Cell head')] },
+          P(null, T('cell para')),
+          { type: 'bulletList', content: [LI(P(null, T('cell bullet')))] },
+        ] },
+        { type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: [240] }, content: [P(null, T('B1'), IMGN(80, 40))] },
+      ] },
+      { type: 'tableRow', content: [
+        { type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: [120] }, content: [P(null, T('A2'))] },
+        { type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: [240], borderTop: 'none', borderRight: '2.25pt solid #FF0000' }, content: [P(null, T('B2'))] },
+      ] },
+    ] },
+    // A list and a nested image survive only in a Writer text frame — a drawing-object
+    // text box flattens both, so this guards the Frame-parent discriminator.
+    PBX({ width: 288, height: 96, fillColor: '#FFFFFF', strokeColor: '#000000', strokeWidthPt: 1 },
+      P(null, T('box text')),
+      { type: 'bulletList', content: [LI(P(null, T('box bullet')))] },
+      P(null, T('second para'), IMGN(40, 20))),
+    PBX({ width: 192, height: 96, wrap: 'right', shapeKind: 'ellipse', fillColor: '#FFEE00', strokeColor: '#FF0000', strokeWidthPt: 2.25, rotation: 30 },
+      P(null, T('in ellipse'))),
+    P(null, T('The end.')),
+  ],
+};
+
+// --- same normalization as roundtrip.test.ts, with LibreOffice unit-noise tolerances ---
+const DEFAULTS: Record<string, unknown> = {
+  textAlign: 'left', lineHeight: null, spaceBefore: null, spaceAfter: null,
+  listStyleType: 'decimal', start: 1, rowHeight: null, colspan: 1, rowspan: 1, type: null,
+  shapeKind: 'textbox', fillColor: '#FFFFFF', strokeColor: '#000000', strokeWidthPt: 1,
+};
+function normalize(node: N, inBox = false): N {
+  const out: N = { type: node.type };
+  if (node.text != null) out.text = node.text;
+  if (node.marks?.length) {
+    const marks = node.marks.map((m: N) => {
+      const mm: N = { type: m.type };
+      const attrs = Object.fromEntries(Object.entries(m.attrs ?? {}).filter(([, v]) => v != null));
+      if (inBox) delete attrs.lang;
+      if (Object.keys(attrs).length) mm.attrs = attrs;
+      return mm;
+    }).filter((m: N) => m.type !== 'textStyle' || m.attrs)
+      .sort((a: N, b: N) => a.type.localeCompare(b.type));
+    if (marks.length) out.marks = marks;
+  }
+  const attrs: N = {};
+  for (const [k, v] of Object.entries(node.attrs ?? {})) {
+    if (v == null || (k in DEFAULTS && DEFAULTS[k] === v)) continue;
+    if (k === 'colwidth') { attrs.colwidth = 'CW'; continue; }
+    if (k === 'rowHeight') { attrs.rowHeight = Math.round((v as number) / 3) * 3; continue; } // ±3px unit noise
+    if (k === 'src') { attrs.src = 'IMG'; continue; } // LibreOffice may re-encode / rename the picture
+    if (k === 'width' || k === 'height') { attrs[k] = Math.round((v as number) / 3) * 3; continue; } // ±unit noise
+    if (k === 'rotation') { attrs.rotation = 'R'; continue; } // exact angle checked leniently below
+    if (k === 'wrap') { attrs.wrap = 'W'; continue; } // float survives; exact mode checked leniently
+    if (k === 'strokeWidthPt') { attrs.strokeWidthPt = Math.round((v as number) * 4) / 4; continue; } // pt↔in noise
+    // Cell borders: LO re-saves widths with pt↔cm noise; quantize to 0.25pt steps.
+    if (k.startsWith('border') && typeof v === 'string' && v !== 'none') {
+      const bm = /^([\d.]+)pt solid (#[0-9A-F]{6})$/i.exec(v);
+      if (bm) { attrs[k] = `${Math.round(parseFloat(bm[1]) * 4) / 4}pt solid ${bm[2].toUpperCase()}`; continue; }
+    }
+    if (k === 'fillColor' || k === 'strokeColor') { attrs[k] = typeof v === 'string' ? v.toUpperCase() : v; continue; }
+    // LO re-parents text-box paragraphs onto its Frame-contents style (margin 0), so
+    // an explicit spaceAfter 0 comes back where Standard's default was suppressed.
+    if (k === 'spaceAfter' && v === 0) continue;
+    // A shape's text carries the document language spelled out; LibreOffice hands it back
+    // on the runs and stamps its own locale on the paragraph, so neither is compared.
+    if (k === 'lang' && inBox) continue;
+    attrs[k] = v;
+  }
+  if (Object.keys(attrs).length) out.attrs = attrs;
+  if (node.content?.length) {
+    const mapped = node.content.map((c: N) => normalize(c, inBox || node.type === 'textBox'));
+    // LibreOffice re-anchors paragraph-anchored (floating) frames to the paragraph
+    // start; a float's inline position is visually meaningless, so canonicalize it.
+    const isFloat = (c: N) => c.type === 'image' && c.attrs?.wrap;
+    const ordered = [...mapped.filter(isFloat), ...mapped.filter((c: N) => !isFloat(c))];
+    const kids: N[] = [];
+    for (const c of ordered) {
+      const prev = kids[kids.length - 1];
+      if (prev && prev.type === 'text' && c.type === 'text' &&
+          JSON.stringify(prev.marks ?? null) === JSON.stringify(c.marks ?? null)) prev.text += c.text;
+      else kids.push(c);
+    }
+    out.content = kids;
+  }
+  return out;
+}
+function firstDiff(a: N, b: N, path = '$'): string | null {
+  if (typeof a !== typeof b) return `${path}: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`;
+  if (typeof a !== 'object' || a === null || b === null) {
+    return Object.is(a, b) ? null : `${path}: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`;
+  }
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    const d = firstDiff(a[k], b[k], `${path}.${k}`);
+    if (d) return d;
+  }
+  return null;
+}
+
+// Generous per-test timeouts: a cold soffice start under a parallel `npm test`
+// run easily exceeds vitest's 5s default.
+describe.skipIf(!SOFFICE)('LibreOffice round-trip (needs soffice on PATH)', () => {
+  it('survives a `soffice --convert-to odt` re-save of the body document', { timeout: 180000 }, async () => {
+    // An explicit document language: LibreOffice stamps its own locale as the default
+    // otherwise, and a paragraph language equal to that default is inherited, not written.
+    const bytes = await buildOdt(fixture, margins, 'landscape', undefined, { language: 'de', country: 'DE' });
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/doc.odt', bytes);
+
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/out /tmp/lo-rt/doc.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/out/doc.odt'));
+
+    const res = importOdt(resaved);
+    check('LO: no warnings', res.warnings.length === 0, res.warnings);
+    check('LO: orientation', res.orientation === 'landscape', res.orientation);
+    const m = res.margins!;
+    check('LO: margins', !!m && Math.abs(m.top - 3) < 0.03 && Math.abs(m.bottom - 2) < 0.03 &&
+      Math.abs(m.left - 2.5) < 0.03 && Math.abs(m.right - 1.5) < 0.03, m);
+
+    const diff = firstDiff(normalize(fixture), normalize(res.content));
+    check('LO: document JSON round-trips', diff === null, diff);
+
+    // Rotation survives LibreOffice. Allow its 360-complement in case LO flips the sign.
+    const imgs: N[] = [];
+    (function walk(n: N) { if (n.type === 'image') imgs.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    const rot = imgs.find((i: N) => i.attrs?.rotation)?.attrs?.rotation ?? 0;
+    check('LO: image rotation survives (~30°)', Math.abs(rot - 30) <= 2 || Math.abs(rot - 330) <= 2, rot);
+    const floated = imgs.find((i: N) => i.attrs?.wrap && i.attrs.wrap !== 'inline');
+    check('LO: image text-wrap survives', !!floated, imgs.map((i: N) => i.attrs?.wrap));
+
+    // Text boxes: geometry, colors and shape kind must survive the LO re-save.
+    const boxes = boxesIn(res.content);
+    check('LO: both text boxes survive', boxes.length === 2, (res.content.content ?? []).map((n: N) => n.type));
+    const [plain, ellipse] = boxes;
+    check('LO: box geometry survives (288×96)', Math.abs((plain?.attrs?.width ?? 0) - 288) <= 3 && Math.abs((plain?.attrs?.height ?? 0) - 96) <= 3, plain?.attrs);
+    check('LO: box content survives (para, list, para)', plain?.content?.length === 3
+      && plain?.content?.[1]?.type === 'bulletList', plain?.content?.map((n: N) => n.type));
+    check('LO: box keeps its nested image', JSON.stringify(plain).includes('"image"'), plain?.content);
+    check('LO: ellipse kind + fill survive', ellipse?.attrs?.shapeKind === 'ellipse' && String(ellipse?.attrs?.fillColor).toUpperCase() === '#FFEE00', ellipse?.attrs);
+    const brot = ellipse?.attrs?.rotation ?? 0;
+    check('LO: ellipse rotation survives (~30°)', Math.abs(brot - 30) <= 2 || Math.abs(brot - 330) <= 2, brot);
+    check('LO: ellipse wrap survives', !!ellipse?.attrs?.wrap && ellipse.attrs.wrap !== 'inline', ellipse?.attrs);
+  });
+
+  it('survives a `soffice` re-save of the header/footer geometry', { timeout: 180000 }, async () => {
+    const header: N = { type: 'doc', content: [{ type: 'paragraph', attrs: { textAlign: 'right' }, content: [
+      T('Bericht ', { type: 'bold' }, { type: 'textStyle', attrs: { color: '#C00000' } }),
+      T('2026'),
+    ] }] };
+    const footer: N = { type: 'doc', content: [{ type: 'paragraph', attrs: { textAlign: 'center' }, content: [
+      T('Seite '), { type: 'pageNumber' }, T(' von '), { type: 'pageCount' },
+    ] }] };
+    const hfMargins = { top: 2.54, bottom: 2.54, left: 2, right: 2 };
+    // Non-default edge distances must survive LibreOffice (they become the ODF page
+    // margin; min-height fills the rest so the body stays at 2.54cm).
+    const hfBytes = await buildOdt(fixture, hfMargins, 'portrait', { header, footer, pageCount: 4, headerDistanceCm: 0.8, footerDistanceCm: 1.6 });
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/hf.odt', hfBytes);
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/hfout /tmp/lo-rt/hf.odt', { stdio: 'pipe', timeout: 120000 });
+    const hfResaved = new Uint8Array(readFileSync('/tmp/lo-rt/hfout/hf.odt'));
+
+    // Diagnostic: how LibreOffice rewrote the header/footer geometry.
+    const loStyles = strFromU8(unzipSync(hfResaved)['styles.xml']);
+    const geo = loStyles.match(/<style:(header|footer)-style>[\s\S]*?<\/style:\1-style>/g);
+    console.log('  [LO header/footer geometry]', geo?.join(' ') ?? '(none)');
+
+    const hfRes = importOdt(hfResaved);
+    check('LO hf: header text + bold/color', !!hfRes.header && JSON.stringify(hfRes.header).includes('Bericht'), hfRes.header);
+    check('LO hf: header right-aligned', hfRes.header?.content?.[0]?.attrs?.textAlign === 'right', hfRes.header?.content?.[0]?.attrs);
+    const fPara = hfRes.footer?.content?.[0];
+    check('LO hf: footer page-number field survives', fPara?.content?.some((n: N) => n.type === 'pageNumber'), fPara);
+    check('LO hf: footer page-count field survives', fPara?.content?.some((n: N) => n.type === 'pageCount'), fPara);
+    check('LO hf: footer centered', fPara?.attrs?.textAlign === 'center', fPara?.attrs);
+    // The geometry trap: body margins must come back ≈ the originals (2.54cm).
+    const hm = hfRes.margins!;
+    check('LO hf: body top margin reconstructed ≈2.54', Math.abs((hm?.top ?? 0) - 2.54) < 0.1, hm);
+    check('LO hf: body bottom margin reconstructed ≈2.54', Math.abs((hm?.bottom ?? 0) - 2.54) < 0.1, hm);
+    // The configured edge distances survive LibreOffice.
+    check('LO hf: header distance ≈0.8cm', Math.abs((hfRes.headerDistanceCm ?? 0) - 0.8) < 0.1, hfRes.headerDistanceCm);
+    check('LO hf: footer distance ≈1.6cm', Math.abs((hfRes.footerDistanceCm ?? 0) - 1.6) < 0.1, hfRes.footerDistanceCm);
+  });
+
+  it('survives a `soffice` re-save of the tab interval and a stop leader', { timeout: 180000 }, async () => {
+    const tabDoc: N = { type: 'doc', content: [
+      { type: 'paragraph', attrs: { tabStops: '6l.;12r_' }, content: [T('Kapitel\t1\tS. 3')] },
+    ] };
+    const bytes = await buildOdt(tabDoc, margins, 'portrait', undefined, undefined, 'A4', undefined, 1.27);
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/tab.odt', bytes);
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/tabout /tmp/lo-rt/tab.odt', { stdio: 'pipe', timeout: 120000 });
+
+    const res = importOdt(new Uint8Array(readFileSync('/tmp/lo-rt/tabout/tab.odt')));
+    check('LO tab: no warnings', res.warnings.length === 0, res.warnings);
+    check('LO tab: interval ≈1.27cm', Math.abs((res.tabIntervalCm ?? 0) - 1.27) < 0.01, res.tabIntervalCm);
+    const stops = (res.content.content ?? [])[0]?.attrs?.tabStops;
+    check('LO tab: stops + leaders survive', stops === '6l.;12r_', stops);
+  });
+
+  // Needs the libreoffice-math package: without it LibreOffice silently drops every
+  // formula object on load, so this leg reports zero formulas instead of failing loudly.
+  it('survives a `soffice` re-save of embedded formula objects', { timeout: 180000 }, async () => {
+    const F = (latex: string, display: boolean): N => ({ type: 'formula', attrs: { latex, display } });
+    const inline = '\\phi _{ref}=\\frac{a+1}{2\\pi }';
+    const block = '\\sum_{i=1}^{n} \\sqrt{x_{i}^{2}+1}=\\left(\\frac{\\alpha }{\\beta }\\right)';
+    const doc: N = { type: 'doc', content: [
+      P(null, T('Inline: '), F(inline, false), T(' im Text.')),
+      P(null, F(block, true)),
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/math.odt', await buildOdt(doc, margins, 'portrait'));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/mathout /tmp/lo-rt/math.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/mathout/math.odt'));
+
+    // LibreOffice keeps them as real formula sub-documents (it adds its own settings.xml).
+    const names = Object.keys(unzipSync(resaved)).filter((p) => /content\.xml$/.test(p) && p !== 'content.xml');
+    check('LO math: both objects survive as sub-documents', names.length === 2, names);
+
+    const res = importOdt(resaved);
+    check('LO math: no warnings', res.warnings.length === 0, res.warnings);
+    const found: N[] = [];
+    (function walk(n: N) { if (n.type === 'formula') found.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    check('LO math: both formulas come back', found.length === 2, found.length);
+    check('LO math: inline source survives', found[0]?.attrs?.latex === inline, found[0]?.attrs?.latex);
+    check('LO math: display source survives', found[1]?.attrs?.latex === block, found[1]?.attrs?.latex);
+    // LibreOffice writes display="block" on every formula it re-saves, so the flag is
+    // read off the paragraph instead — an inline formula must not come back displayed.
+    check('LO math: inline stays inline, display stays display',
+      found[0]?.attrs?.display === false && found[1]?.attrs?.display === true,
+      found.map((f) => f.attrs?.display));
+  });
+
+  it('survives a `soffice` re-save of bookmarks and cross-references', { timeout: 180000 }, async () => {
+    const doc: N = { type: 'doc', content: [
+      P(null, T('Figure '), T('Figure 1', { type: 'bookmark', attrs: { name: 'Fig1' } }), T(' – a caption')),
+      P(null,
+        T('See '), { type: 'crossRef', attrs: { name: 'Fig1', format: 'text', text: 'Figure 1' } },
+        T(' on page '), { type: 'crossRef', attrs: { name: 'Fig1', format: 'page', text: '1' } },
+        T(' or '), T('jump', { type: 'link', attrs: { href: '#Fig1' } }), T('.'),
+      ),
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/bm.odt', await buildOdt(doc, margins, 'portrait'));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/bmout /tmp/lo-rt/bm.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/bmout/bm.odt'));
+    const xml = strFromU8(unzipSync(resaved)['content.xml']);
+
+    check('LO bookmarks: the range survives', xml.includes('text:bookmark-start text:name="Fig1"') && xml.includes('text:bookmark-end text:name="Fig1"'));
+    check('LO bookmarks: both references stay fields', (xml.match(/<text:bookmark-ref/g) ?? []).length === 2, xml.match(/<text:bookmark-ref[^>]*>/g));
+
+    const res = importOdt(resaved);
+    const marked: N[] = [];
+    const refs: N[] = [];
+    (function walk(n: N) {
+      if (n.type === 'crossRef') refs.push(n);
+      if ((n.marks ?? []).some((m: N) => m.type === 'bookmark')) marked.push(n);
+      for (const c of n.content ?? []) walk(c);
+    })(res.content);
+    check('LO bookmarks: the mark comes back on its text', marked[0]?.text === 'Figure 1', marked.map((m) => m.text));
+    check('LO bookmarks: both references come back',
+      refs.map((r) => `${r.attrs.name}/${r.attrs.format}`).join(',') === 'Fig1/text,Fig1/page',
+      refs.map((r) => r.attrs));
+    // LibreOffice re-evaluates the fields on load, so the shown values are its own.
+    check('LO bookmarks: the text reference resolves to the caption', refs[0]?.attrs?.text === 'Figure 1', refs[0]?.attrs?.text);
+  });
+
+  it('survives a `soffice` re-save of every cross-reference kind', { timeout: 180000 }, async () => {
+    // A caption and a note have a field of their own in ODF, and a chapter number is a
+    // reference format rather than text — LibreOffice has to keep all three live.
+    const sheet = builtinStyleSheet();
+    sheet.outline = [1, 2, 3].map(() => ({ ...DEFAULT_OUTLINE_LEVEL, format: '1' as const, displayLevels: 3 }));
+    const cap = { type: 'bookmark', attrs: { name: 'Cap1' } };
+    const doc: N = { type: 'doc', content: [
+      { type: 'heading', attrs: { level: 1 }, content: [T('Chapter one', { type: 'bookmark', attrs: { name: 'Head1' } })] },
+      P({ styleName: 'Caption' }, T('Figure ', cap),
+        { type: 'sequenceField', attrs: { category: 'figure', format: '1', number: 1 }, marks: [cap] },
+        T(': a picture')),
+      P(null, T('Body'), { type: 'noteRef', attrs: { id: 'a', kind: 'footnote', text: '1' } }, T('.')),
+      P(null,
+        { type: 'crossRef', attrs: { name: 'Head1', format: 'number-all-superior', text: '1' } },
+        T(' / '), { type: 'crossRef', attrs: { name: 'Head1', format: 'direction', text: 'above' } },
+        T(' / '), { type: 'crossRef', attrs: { name: 'Cap1', format: 'category-and-value', kind: 'sequence', text: 'Figure 1' } },
+        T(' / '), { type: 'crossRef', attrs: { name: 'a', format: 'text', kind: 'note', text: '1' } },
+      ),
+      { type: 'noteSection', content: [
+        { type: 'note', attrs: { id: 'a', kind: 'footnote', label: null, text: '1' }, content: [T('The note.')] },
+      ] },
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/xr.odt', await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', sheet));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/xrout /tmp/lo-rt/xr.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/xrout/xr.odt'));
+    const xml = strFromU8(unzipSync(resaved)['content.xml']);
+
+    check('LO references: the caption keeps its own sequence field', /<text:sequence-ref[^>]*category-and-value/.test(xml), xml.match(/<text:sequence-ref[^>]*>/g));
+    check('LO references: the note keeps its own note field', /<text:note-ref[^>]*note-class="footnote"/.test(xml), xml.match(/<text:note-ref[^>]*>/g));
+    check('LO references: the chapter number and the direction stay bookmark fields',
+      (xml.match(/<text:bookmark-ref/g) ?? []).length === 2, xml.match(/<text:bookmark-ref[^>]*>/g));
+
+    const refs: N[] = [];
+    (function walk(n: N) {
+      if (n.type === 'crossRef') refs.push(n);
+      for (const c of n.content ?? []) walk(c);
+    })(importOdt(resaved).content);
+    check('LO references: all four come back as fields',
+      refs.map((r) => `${r.attrs.kind ?? 'bookmark'}/${r.attrs.format}`).join(',')
+        === 'bookmark/number-all-superior,bookmark/direction,sequence/category-and-value,note/text',
+      refs.map((r) => r.attrs));
+    // LibreOffice re-evaluates every field on load, so the shown values are its own.
+    check('LO references: it resolves the chapter number, the caption and the note',
+      refs[0]?.attrs?.text === '1' && refs[2]?.attrs?.text === 'Figure 1' && refs[3]?.attrs?.text === '1',
+      refs.map((r) => r.attrs?.text));
+  });
+
+  it('survives a `soffice` re-save of footnotes and endnotes', { timeout: 180000 }, async () => {
+    const doc: N = { type: 'doc', content: [
+      P(null, T('Body one'), { type: 'noteRef', attrs: { id: 'a', kind: 'footnote', text: '1' } }, T(' and on.')),
+      P(null, T('Body two'), { type: 'noteRef', attrs: { id: 'b', kind: 'endnote', text: 'i' } }, T(' ends.')),
+      { type: 'noteSection', content: [
+        { type: 'note', attrs: { id: 'a', kind: 'footnote', label: null, text: '1' },
+          content: [T('The footnote, with '), T('bold', { type: 'bold' }), T(' inside.')] },
+        { type: 'note', attrs: { id: 'b', kind: 'endnote', label: null, text: 'i' },
+          content: [T('The endnote.')] },
+      ] },
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/note.odt', await buildOdt(doc, margins, 'portrait'));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/noteout /tmp/lo-rt/note.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/noteout/note.odt'));
+    const files = unzipSync(resaved);
+    const xml = strFromU8(files['content.xml']);
+
+    // LibreOffice drops a note it cannot parse, so surviving its re-save is the proof
+    // that the anchor, the citation and the body are where the format wants them.
+    check('LO notes: both classes survive', /text:note-class="footnote"/.test(xml) && /text:note-class="endnote"/.test(xml), xml.match(/<text:note [^>]*>/g));
+    check('LO notes: the body keeps the Footnote style', /<text:note-body><text:p text:style-name="Footnote"/.test(xml), xml.match(/<text:note-body>[\s\S]{0,60}/g));
+    const styles = strFromU8(files['styles.xml']);
+    check('LO notes: it keeps our numbering configuration', /text:note-class="endnote"[^>]*style:num-format="i"/.test(styles), styles.match(/<text:notes-configuration[^>]*>/g));
+
+    const res = importOdt(resaved);
+    const refs: N[] = [];
+    (function walk(n: N) { if (n.type === 'noteRef') refs.push(n); for (const c of n.content ?? []) walk(c); })(res.content);
+    const section = (res.content.content ?? []).find((n: N) => n.type === 'noteSection');
+    check('LO notes: both anchors come back', refs.length === 2, refs.map((r) => r.attrs));
+    check('LO notes: their classes survive', refs.map((r) => r.attrs.kind).join(',') === 'footnote,endnote', refs.map((r) => r.attrs.kind));
+    check('LO notes: each anchor still points at its own note', refs[0]?.attrs?.id === section?.content?.[0]?.attrs?.id, [refs.map((r) => r.attrs.id), section?.content?.map((n: N) => n.attrs.id)]);
+    check('LO notes: the note text comes back', JSON.stringify(section).includes('The footnote, with'), JSON.stringify(section)?.slice(0, 200));
+    check('LO notes: bold inside the note survives', JSON.stringify(section).includes('"bold"'), JSON.stringify(section)?.slice(0, 300));
+  });
+
+  it('survives a `soffice` re-save of a bibliography', { timeout: 180000 }, async () => {
+    const cite = (identifier: string, type: string, fields: Record<string, string>): N =>
+      ({ type: 'bibliographyEntry', attrs: { identifier, type, fields, text: '' } });
+    const KAF = { author: 'Kafka, Franz', title: 'Der Process', year: '1925', publisher: 'Kurt Wolff' };
+    const MEY = { author: 'Meyer, Anna', title: 'Zur Sache', year: '1999', journal: 'Zeitschrift' };
+    const doc: N = { type: 'doc', content: [
+      P(null, T('Ein Satz mit Beleg '), cite('KAF01', 'book', KAF), T('.')),
+      P(null, T('Und noch einer '), cite('MEY99', 'article', MEY), T(', wieder '), cite('KAF01', 'book', KAF), T('.')),
+      { type: 'tableOfContents', attrs: { index: 'bibliography', title: 'Literaturverzeichnis', entries: [
+        { text: 'KAF01: Kafka, Franz, Der Process, 1925', level: 1, page: 1 },
+        { text: 'MEY99: Meyer, Anna, Zur Sache, 1999', level: 1, page: 1 },
+      ] } },
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/bib.odt', await buildOdt(doc, margins, 'portrait'));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/bibout /tmp/lo-rt/bib.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/bibout/bib.odt'));
+    const xml = strFromU8(unzipSync(resaved)['content.xml']);
+
+    check('LO bibliography: all three marks survive', (xml.match(/<text:bibliography-mark/g) ?? []).length === 3,
+      xml.match(/<text:bibliography-mark[^>]*>/g));
+    check('LO bibliography: a mark keeps its whole record',
+      xml.includes('text:author="Kafka, Franz"') && xml.includes('text:publisher="Kurt Wolff"') && xml.includes('text:year="1925"'),
+      xml.match(/<text:bibliography-mark[^>]*>/g)?.[0]);
+    check('LO bibliography: the index stays one', xml.includes('<text:bibliography '), xml.match(/<text:bibliography[^>-][^>]*>/g));
+
+    const res = importOdt(resaved);
+    const cites: N[] = [];
+    let index: N = null;
+    (function walk(n: N) {
+      if (n.type === 'bibliographyEntry') cites.push(n);
+      if (n.type === 'tableOfContents') index = n;
+      for (const c of n.content ?? []) walk(c);
+    })(res.content);
+    check('LO bibliography: every citation comes back',
+      cites.map((c) => c.attrs.identifier).join(',') === 'KAF01,MEY99,KAF01', cites.map((c) => c.attrs));
+    check('LO bibliography: the record comes back with it',
+      cites[0]?.attrs?.fields?.author === 'Kafka, Franz' && cites[0]?.attrs?.fields?.year === '1925', cites[0]?.attrs?.fields);
+    check('LO bibliography: the type comes back', cites[1]?.attrs?.type === 'article', cites[1]?.attrs?.type);
+    check('LO bibliography: the index comes back as one', index?.attrs?.index === 'bibliography', index?.attrs?.index);
+    check('LO bibliography: its rows come back',
+      (index?.attrs?.entries ?? []).map((e: N) => e.text).join(' | ')
+        === 'KAF01: Kafka, Franz, Der Process, 1925 | MEY99: Meyer, Anna, Zur Sache, 1999',
+      index?.attrs?.entries);
+  });
+
+  it('survives a `soffice` re-save of named list styles', { timeout: 180000 }, async () => {
+    const { builtinStyleSheet } = await import('../src/lib/styles/styleSheet');
+    const sheet = builtinStyleSheet();
+    sheet.list['Prüfliste'] = {
+      name: 'Prüfliste',
+      levels: [
+        { kind: 'number', numType: 'upper-roman-paren', markerAlign: 'right', indentCm: 0.5 },
+        { kind: 'bullet', bulletChar: '✓' },
+        { kind: 'number', numType: 'lower-alpha' },
+      ],
+    };
+    const doc: N = { type: 'doc', content: [
+      { type: 'orderedList', attrs: { listStyleName: 'Prüfliste' }, content: [
+        LI(P(null, T('one')), { type: 'bulletList', content: [LI(P(null, T('sub')))] }),
+        LI(P(null, T('two'))),
+      ] },
+      P(null, T('between')),
+      { type: 'bulletList', attrs: { listStyleName: 'Diamond Bullets' }, content: [LI(P(null, T('dash')))] },
+      // A bullet tree under the same style: level 1 is a number level, so the style
+      // decides the kind and LibreOffice must render (and keep) the numbering.
+      { type: 'bulletList', attrs: { listStyleName: 'Prüfliste' }, content: [
+        LI(P(null, T('mix')), { type: 'bulletList', content: [LI(P(null, T('mixsub')))] }),
+      ] },
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/ls.odt', await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', sheet));
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/lsout /tmp/lo-rt/ls.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/lsout/ls.odt'));
+    const files = unzipSync(resaved);
+    const xml = strFromU8(files['content.xml']);
+    const stylesXml = strFromU8(files['styles.xml']);
+
+    // LibreOffice keeps the named reference and the definition (probed) — this is
+    // the assignment surviving a real editor, not just our own reader.
+    check('LO lists: the definition stays named in styles.xml',
+      /<text:list-style style:name="Prüfliste"/.test(stylesXml), stylesXml.match(/<text:list-style[^>]*>/g));
+    check('LO lists: the list still references it', xml.includes('text:style-name="Prüfliste"'), xml.match(/<text:list [^>]*>/g));
+
+    const res = importOdt(resaved);
+    const lists = (res.content.content ?? []).filter((n: N) => n.type === 'orderedList' || n.type === 'bulletList');
+    check('LO lists: the assignment comes back', lists[0]?.attrs?.listStyleName === 'Prüfliste', lists[0]?.attrs);
+    check('LO lists: the built-in assignment comes back', lists[1]?.attrs?.listStyleName === 'Diamond Bullets', lists[1]?.attrs);
+    check('LO lists: no per-level attrs accrete',
+      !lists[0]?.attrs?.listStyleType && !lists[0]?.attrs?.indent && !lists[0]?.attrs?.markerAlign, lists[0]?.attrs);
+    const imported = res.styles.list['Prüfliste'];
+    check('LO lists: the definition comes back', imported?.levels[0]?.numType === 'upper-roman-paren'
+      && imported?.levels[0]?.markerAlign === 'right' && imported?.levels[1]?.bulletChar === '✓', imported?.levels?.slice(0, 2));
+    check('LO lists: the level indent survives the unit round-trip',
+      Math.abs((imported?.levels[0]?.indentCm ?? 0) - 0.5) < 0.02, imported?.levels[0]);
+    check('LO lists: the species-mismatched tree keeps the style',
+      lists[2]?.attrs?.listStyleName === 'Prüfliste', lists[2]?.attrs);
+    check('LO lists: its kinds come back as the levels say (number, then bullet)',
+      lists[2]?.type === 'orderedList' && lists[2]?.content?.[0]?.content?.[1]?.type === 'bulletList', lists[2]);
+  });
+
+  // The one leg where a foreign consumer resolves our styles instead of our own
+  // importer: duplicate or dangling definitions surface here, not in the round trips.
+  it('resolves the DOCX style chain as the editor does (soffice → fodt)', { timeout: 180000 }, async () => {
+    const { buildDocx } = await import('../src/lib/export/docx');
+    const doc: N = { type: 'doc', content: [
+      P({ styleName: 'Title' }, T('Der Titel')),
+      { type: 'heading', attrs: { level: 1 }, content: [T('Kapitel')] },
+      { type: 'heading', attrs: { level: 2 }, content: [T('Abschnitt')] },
+      P(null, T('Fließtext.')),
+      // The table style used to make the library drop its factory set, w:docDefaults
+      // (default font, size, language) included — keep one in this fixture forever.
+      { type: 'table', attrs: { tableStyle: 'Box List Blue' }, content: [
+        { type: 'tableRow', content: [
+          { type: 'tableCell', attrs: { colspan: 1, rowspan: 1, colwidth: null }, content: [P(null, T('Zelle'))] },
+        ] },
+      ] },
+    ] };
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/res.docx', await buildDocx(doc));
+    execSync('soffice --headless --convert-to fodt --outdir /tmp/lo-rt/resout /tmp/lo-rt/res.docx', { stdio: 'pipe', timeout: 120000 });
+    const fodt = readFileSync('/tmp/lo-rt/resout/res.fodt', 'utf8');
+    const style = (name: string) =>
+      new RegExp(`<style:style style:name="${name}"[^>]*>[\\s\\S]*?</style:style>`).exec(fodt)?.[0] ?? '';
+
+    // The chain: Heading carries the sans font and bold, the levels size it.
+    const heading = style('Heading');
+    check('LO resolve: Heading is Arial', /style:font-name="Arial"|fo:font-family="[^"]*Arial/.test(heading), heading);
+    check('LO resolve: Heading is bold', /fo:font-weight="bold"/.test(heading), heading);
+    const h1 = style('Heading_20_1');
+    check('LO resolve: Heading 1 inherits from Heading', /style:parent-style-name="Heading"/.test(h1), h1);
+    check('LO resolve: Heading 1 is 18pt', /fo:font-size="18pt"/.test(h1), h1);
+    const h2 = style('Heading_20_2');
+    check('LO resolve: Heading 2 inherits from Heading', /style:parent-style-name="Heading"/.test(h2), h2);
+    check('LO resolve: Heading 2 is 16pt', /fo:font-size="16pt"/.test(h2), h2);
+    const title = style('Title');
+    check('LO resolve: Title inherits from Heading', /style:parent-style-name="Heading"/.test(title), title);
+    check('LO resolve: Title is 28pt', /fo:font-size="28pt"/.test(title), title);
+    // w:docDefaults arrive on Standard itself, the style LibreOffice maps "Normal" onto.
+    const defaults = style('Standard');
+    check('LO resolve: the default font arrives', /Times New Roman/.test(defaults), defaults);
+    check('LO resolve: the default size arrives', /fo:font-size="12pt"/.test(defaults), defaults);
+  });
+
+  it('survives a `soffice` re-save of the record-changes flag', { timeout: 180000 }, async () => {
+    const doc: N = { type: 'doc', content: [P(null, T('Ein Satz.'))] };
+    const bytes = await buildOdt(doc, margins, 'portrait', undefined, null, 'A4', undefined,
+      undefined, 'add', false, undefined, undefined, false, undefined, undefined, undefined, true);
+    mkdirSync('/tmp/lo-rt', { recursive: true });
+    writeFileSync('/tmp/lo-rt/rec.odt', bytes);
+    execSync('soffice --headless --convert-to odt --outdir /tmp/lo-rt/recout /tmp/lo-rt/rec.odt', { stdio: 'pipe', timeout: 120000 });
+    const resaved = new Uint8Array(readFileSync('/tmp/lo-rt/recout/rec.odt'));
+    const xml = strFromU8(unzipSync(resaved)['content.xml']);
+
+    // LibreOffice keeps the empty registry for the flag alone, which is what makes it
+    // the document's setting rather than the editor's.
+    check('LO: the flag comes back', /<text:tracked-changes[^>]*text:track-changes="true"/.test(xml),
+      xml.match(/<text:tracked-changes[^>]*>/g));
+    check('LO: and the importer reads it', importOdt(resaved).recordChanges === true);
+  });
+});

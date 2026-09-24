@@ -1,0 +1,133 @@
+# Headless browser testing
+
+With no test suite, the way to verify rendering, layout, or interaction is to drive the live app in a headless browser. **This container is linux arm64 (`uname -m` → `aarch64`)** — the one gotcha. Use it for any check: pagination, list-marker/float layout, table sizing, header/footer, theme colors, image drag/resize, ODF round-trips, etc. PDF export is just one example.
+
+- **Don't** use `puppeteer` / `npx @puppeteer/browsers install chrome-headless-shell`: they fetch an x86-64 Chrome that can't run here (`rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2`). No arm64 chrome-headless-shell build exists.
+- **Use Playwright's Chromium** (native arm64): `npm install --no-save playwright-core && npx playwright-core install chromium` → binary at `~/.cache/ms-playwright/chromium-*/chrome-linux/chrome`. Playwright's `install-deps` host check errors out, but the libs install via apt: `apt-get install -y libdbus-1-3 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libatspi2.0-0 libpango-1.0-0 libcairo2`. Launch with playwright-core, `executablePath` at that binary, `args: ['--no-sandbox']`.
+
+Then load `npm run dev`, inject a document into `localStorage['edentext-doc']`, reload, and read live DOM geometry (`getBoundingClientRect`, `Range.getClientRects`) or screenshot. This is the only way to exercise the editor's live ProseMirror NodeViews (e.g. the image node), which `generateHTML` can't reproduce. The `debug/pagebreak-debug-*.json` snapshots carry the live `doc` JSON, handy to inject.
+
+For PDF-export repros specifically: replicate `pdf.ts`'s clone + `html2canvas(...)` inside `page.evaluate` and read the canvas back as a PNG — capturing the real jsPDF `doc.save()` download tends to hang in headless. Inspect output PDFs with poppler-utils (`apt-get install -y poppler-utils`: `pdftoppm`, `pdfimages`, `pdftotext`).
+
+## The four committed browser runs
+
+`npm run test:smoke` and `npm run test:dom` are these probes made permanent: both boot
+`dist/` headless through `tests/browser.mjs` (preview server, checklist, `pageerror`
+collector) and fail on any uncaught page error. The DOM run keeps the pagination
+invariants of pass 4 below — one page count through a settle, a reload, a zoom, a page
+break and its undo — which is the only test `src/lib/components/**` has.
+
+`npm run test:layout` and `npm run test:monkey` run against the dev server (Vite serves
+TypeScript, so a page imports `src/` and `tests/` modules directly). The **layout run**
+opens every corpus and showcase document plus `LAYOUT_SEEDS` fuzz seeds, holds the editor's
+page count against LibreOffice's PDF (`soffice` + `pdfinfo`, a page or a tenth of slack)
+and checks the rendered lines: none overlap, none sit in the page gap or past the sheet,
+none cross a single-section document's margins, no heading ends a page or column, nothing
+is wider than the page. A tab's box, a frame, a formula and the decor are not lines.
+It then holds the document against `tests/layout/baseline.json`, which records where each
+page starts and what the load cost: a page starting elsewhere is a layout change the run
+prints page by page, and a load over three times its recorded time is a regression. The
+baseline is keyed by engine and platform (line breaking is theirs) and `LAYOUT_UPDATE=1`
+records it again — the answer to a deliberate change, never to a surprise. A `[regex]`
+argument limits the run to the documents whose name matches. LibreOffice's counts are
+cached by the document's hash in `node_modules/.cache/layout-pages.json`: a count is the
+file's and never our code's, so a run after an editor change has nothing to convert —
+`--no-cache` after installing or removing a font, which does change what it renders.
+The **monkey run** replays `MONKEY_OPS` random keys and commands per seed
+(`MONKEY_SEED`, `MONKEY_RUNS`, `MONKEY_DOC`) on a corpus document — typing, formatting,
+lists, tables, notes, frames and columns — and checks after each:
+no uncaught error, a document its own schema accepts; at the end undo back to the opened
+file and redo forward, then Save As both formats, xmllint each against the schemas and read
+it back through the app's importer. A failing seed prints its last ops and keeps the file
+and both documents under the OS temp dir. Found so far: a note inserted in a text box or a
+text box in a note breaks the ODT's XML, and a table in a cell is dropped on save — both
+commands now refuse there; a page break inside a columns section, which the editor never
+shows and only DOCX writes, is now cleared as the blocks are wrapped; an `.odt` dropped
+every block of a list item after the first, and a header row that the table did not ask to
+repeat came back as ordinary cells. Then: setting one of a heading's two vertical margins
+zeroed the other in the `.odt` (LibreOffice pairs them); a page break before a list item
+reached neither file; a list item's further blocks lost their own alignment, spacing and
+line height in the `.odt`; a run could be subscript and superscript at once; and typing
+over a selection that spans two blocks let the contenteditable's own span land a whole CSS
+font stack, and a weight already saying `bold`, in the document. A list in a table cell
+shifted every body list item's own style by as many items as the cell held; and a heading
+inside a list item came back from the `.odt` as a paragraph. In a note's own text the
+`.docx` lost a formula, a ruby and a leading tab, and a heading in a table cell lost the
+margin it did not set; a list toggle could pull a note anchor into a text box, where the
+`.docx` dropped anchor and note without a word. A running-head or date field in a zone
+lost its own formatting in the `.docx`: the library's simple field writes a bare run.
+Typing over a selection spanning two header cells left a half-header first row, which no
+file keeps. One finding was the checker's own: libxml2's RelaxNG cannot match an element
+the ODF schema declares by name class inside a `<text:span>` (the statistic fields), so a
+formatted page count in a zone read as invalid — LibreOffice writes the same span.
+The run's own `focus(pos)` is snapped to the next text position: TipTap makes the selection
+wherever it is told, and Enter on a caret between two list items throws out of prosemirror —
+a place the view itself never puts one.
+In Firefox: a page break set inside a text box, which neither format keeps, so the same
+plugin now sweeps it from a table cell and a note body too; and the run's 1x1 PNG had a
+truncated IDAT, which only Firefox reports — the same broken bytes were in eleven fixtures.
+WebKit raises `ResizeObserver loop completed with undelivered notifications` as a page
+error — the text box refits the wrapper it observes, so the browser defers the rest of the
+round. That converging loop is the one message `openApp` drops.
+A comment over a line break rides the `hardBreak` too, which no file carries and the
+comment's own text runs keep — `normalize` skips the marks of an inline atom, the picture
+and the formula with it.
+Then the table run: promoting a cell to a header dropped every attr it had; a replace
+reaching into a table left the cell it landed in without its column weight, so redo (which
+replays the recorded step) restored one the edit itself had lost; a list toggle wrapped a
+table into a list item, where the `.odt` drops it; and a heading in a cell came back from
+the `.docx` carrying its size as direct formatting. A list's `listStyleName` is no longer
+compared: direct formatting on a marker makes the file keep the resolved automatic clone
+instead, and `corpus.test.ts` holds the plain round trip. Its marker char goes the same
+way — a list that lost its name carries the char the style drew, so both sides compare the
+drawn one, as the kind already did.
+Still open: a run set to the body's own font, in a columns section, kept its family on the
+held side once in four runs of the same seed chain — the flow rewrites such a document
+between frames, which is why that leg leaves the history unchecked too.
+Both header/footer zones go first, before the body ops can cut the document to one page.
+The run draws the two variant flags and the zone distances from the ribbon's Insert tab
+(Options) — with them on, a double-click on pages 1 to 3 in turn is one session per
+variant — and edits each with `MONKEY_HF_OPS` ops of the zone's own schema: runs, breaks,
+the insert bar's three fields, inline images, left by Done. `16-hf-variants` brings the
+same six zones in through the import path instead. Then one flag is flipped **while a
+zone is open**, which ends the edit (`App.svelte` drops `hfActive` with it): the text
+typed before the flip has to be in the zones all the same. A zone is no part of the
+document, so the saved file is the only thing that reports on it: the round trip holds
+the zones the app's storage keeps against the ones the importer gives back, per section
+and per variant in play. Undo is not among the zone's keys — a pass falls into one
+history group, so a single Mod+Z would empty the zone and the round trip would compare
+nothing. Every run opens its document through `input.file-input[accept*=".odt"]`: the
+Insert tab carries a second `.file-input` for pictures, and a bare class selector picks
+whichever the ribbon happens to be showing.
+
+`BROWSER=chromium|firefox|webkit` picks the engine (Chromium by default; the others via
+`npx playwright-core install firefox webkit`). CI runs both on all three, one per matrix
+leg, WebKit on macOS because only there its text shaping is Safari's. The engines are
+the ones behind `build.target` in `vite.config.ts`; a browser older than that target
+fails to parse the bundle and no run reaches it. Playwright's WebKit is the engine, not
+Safari: storage eviction, the install prompt and iOS input are outside the matrix.
+
+## Hunting for bugs the suite cannot see
+
+`npm run test:coverage` says where to look: the logic modules are dense with tests,
+`src/lib/components/**` and `App.svelte` are at **0%** — every bug found this way so far
+lived there. Give each probe a `pageerror` + `console.error` collector; that alone reports
+faults nobody predicted (two of six were found by clicking controls and reading the console).
+
+Four passes, cheapest first:
+
+1. **Edges** — junk in every `edentext-*` key, truncated/renamed/empty archives, a full localStorage, no IndexedDB, page-tall images, 400-section documents.
+2. **Breadth** — click every control of every tab, watch only for uncaught errors.
+3. **Semantics** — not "does it crash" but "is the answer right": reject a tracked change and compare against the original, TOC page numbers against the measured page of each heading, a numeric sort against 3/10/25. The worst bug found (a reject that ate the original text) crashes nothing.
+4. **Invariants** — snapshot → act → undo → compare; page count stable over reloads; save → reopen; `.docx` and `.odt` of one corpus fixture giving identical counts.
+
+Then repro minimally and take a stack trace off the **dev** server (sourcemaps) with
+`Error.stackTraceLimit = 300` — the default ten frames stop above the cause.
+
+**Budget for false alarms.** Three of four striking signals were the probe's own fault:
+`Range.getClientRects` also returns container rects (a layout checker built on it is noise),
+a stale button index reads as a dead control, and clicking `.tiptap > p` by index hits a
+different block once an edit has reflowed the document. Two more from the DOM run: TipTap's
+`focus()` lands on the next animation frame, so a key sent right after it is lost unless
+`document.activeElement` is awaited; and a page break before the empty last paragraph yields
+no page. Reproduce deterministically before touching any code.

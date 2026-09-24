@@ -1,0 +1,1267 @@
+/* No `:has()` left of `+` or `~` under .tiptap: Chromium then restyles every element under
+   .tiptap (67 000 in a long document, ~150 ms) whenever a child is inserted there — a page
+   spacer, a split paragraph. Mark the block with an attribute instead (image.ts). */
+.editor {
+  flex: 1;
+  /* Top padding clears the toolbar island overlaying this scroll area (height set
+     by App.svelte); extra bottom padding clears the fixed status bar. */
+  padding: calc(var(--toolbar-overlay-h, 0px) + 1.25rem) 1rem 3rem;
+  overflow: auto;
+  /* A flex item's automatic minimum is its content: without this a canvas wider than
+     the window — a page grid, or a page beside the balloon strip — widens the whole app
+     instead of scrolling here, and the toolbar above ends short of it. */
+  min-width: 0;
+  /* Positioning context for the floating table toolbar (TableToolbar.svelte),
+     which is an absolutely-positioned child that scrolls with the content. */
+  position: relative;
+}
+
+/* Reserves the SCALED footprint of the transformed .paper (a CSS transform takes
+   no layout space of its own), so the scrollbars and horizontal centering reflect
+   the zoomed page. Its width/height are sized in JS (Editor.svelte). It is also the
+   origin the margin balloons position in (ReviewMarginLayer.svelte). */
+.paper-scaler {
+  position: relative;
+  margin: 0 auto;
+}
+
+/* A4 paper container (794px = 210mm at 96dpi by default; --user-page-width is
+   set from the Layout panel and swaps to 1123px in landscape — pageOrientation.ts) */
+.paper {
+  /* Driven by --user-page-height (pageOrientation.ts); fallback = A4 portrait. The
+     page geometry lives here, not on .tiptap, so both inherit the same values. */
+  --page-height: var(--user-page-height, 1123px);
+  --page-gap: 20px;
+  --page-cycle: calc(var(--page-height) + var(--page-gap));
+
+  /* The widest section's paper, so a landscape page is not cut at the sheet edge. */
+  width: var(--pb-paper-width, var(--user-page-width, 794px));
+  /* Zoom is a `transform: scale()` set inline (Editor.svelte); pin the origin so the
+     page scales down/right from the top-left of its reserved footprint. */
+  transform-origin: top left;
+  /* Positioning context for the table page-break overlay (.band-layer in
+     Editor.svelte), which lives inside .paper so the same transform scales it
+     identically to the .tiptap page background. */
+  position: relative;
+  /* A frame or a formula wider than the text area is cut at the sheet's edge, as it is
+     in LibreOffice. `clip` rather than `hidden`: it must not become a scroll box. */
+  overflow-x: clip;
+
+  /* The sheets themselves are one box per page (PageSheetLayer), since a section on its
+     own paper makes them differ in size. They sit at z-index -3, under a shape behind
+     the text (-2), a header's page background (.hf-bg-layer, -1) and the body text. */
+}
+
+/* View ▸ Field Shadings: the grey every field is drawn on, switched from one place
+   (class on .paper, Editor.svelte) rather than per field. Off leaves the fields plain. */
+.paper {
+  --color-field-shade: transparent;
+  --color-field-shade-strong: transparent;
+}
+
+.paper.field-shading {
+  --color-field-shade: rgba(0, 0, 0, 0.08);
+  /* An index entry is a 3px bar — at the shade of a whole field it would not be seen. */
+  --color-field-shade-strong: rgba(0, 0, 0, 0.18);
+}
+
+/* The allBlack theme paints the sheet itself dark, so black on black shows nothing. */
+[data-theme="allBlack"] .paper.field-shading {
+  --color-field-shade: rgba(255, 255, 255, 0.14);
+  --color-field-shade-strong: rgba(255, 255, 255, 0.24);
+}
+
+/* While a freshly opened document is still finding its pagination (Editor.svelte).
+   Hidden, not removed: every pass measures the same boxes either way, and the sheet
+   .paper paints stays up, so the page appears once instead of shuffling into place. */
+.paper.settling > * {
+  visibility: hidden;
+}
+
+.paper .tiptap {
+  /* Driven by --user-margin-* set on :root from the Layout panel (pageMargins.ts).
+     Fallbacks preserve the original hardcoded layout when unset. */
+  --page-margin-top: var(--user-margin-top, 96px);
+  --page-margin-bottom: var(--user-margin-bottom, 96px);
+  --page-margin-left: var(--user-margin-left, 80px);
+  --page-margin-right: var(--user-margin-right, 80px);
+
+  position: relative;
+  width: 100%;
+  min-height: var(--page-height);
+  padding: var(--page-margin-top) var(--page-margin-right) var(--page-margin-bottom) var(--page-margin-left);
+  outline: none;
+  font-family: var(--font-serif);
+  /* 12pt matches odf-kit's Standard style and the toolbar's declared default. */
+  font-size: 12pt;
+  /* "Single" spacing is the font's natural line height (Liberation Serif ≈ 1.15× em),
+     not CSS unitless 1. A paragraph's line spacing multiplies that, so the two ride as
+     separate variables and the block rule below is the one place they meet. */
+  --natural-line: 1.15;
+  --line-factor: 1;
+  line-height: 1.15;
+  color: var(--color-page-text);
+
+  /* The page borders ride the sheet boxes (PageSheetLayer). */
+  border: none;
+
+  /* Subtle overall shadow for depth */
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+/* Page break spacer widgets (inserted by ProseMirror decorations).
+   line-height/font-size are zeroed so the spacer doesn't pick up the
+   inherited inline strut when it sits mid-paragraph between text nodes —
+   otherwise the browser adds a phantom line of height around the widget
+   and the continuation text on the next page lands too low.
+   Scoped to div so it never overrides the display of the table-row spacer below. */
+.paper .tiptap div[data-page-break-spacer] {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  line-height: 0;
+  font-size: 0;
+  overflow: hidden;
+}
+
+/* Table page-break spacer: a borderless, empty <tr>/<td> that bridges the page
+   gap so the following rows start on the next page (a table can't hold a block
+   spacer between its rows). Keeps default table-row/cell display. */
+.paper .tiptap tr[data-page-break-spacer] {
+  background: none;
+}
+
+.paper .tiptap td[data-page-break-spacer-cell] {
+  padding: 0;
+  border: none;
+  line-height: 0;
+  font-size: 0;
+}
+
+/* A section whose page setup has side margins of its own insets its top-level blocks by
+   the difference — .tiptap's padding can only draw one pair (pageBreaks.ts sets the two
+   properties per block). Everything that writes a block margin adds them in, so an indent
+   and the inset compose; a descendant clears them, or a nested one would add them twice. */
+.paper .tiptap > * {
+  margin-left: var(--sec-inset-left, 0px);
+  margin-right: var(--sec-inset-right, 0px);
+}
+.paper .tiptap > * * {
+  --sec-inset-left: 0px;
+  --sec-inset-right: 0px;
+}
+
+/* No paragraph spacing by default, like LibreOffice's Default Paragraph Style and
+   Word's implied 0 — an editor default here would show up as extra space in every
+   imported document (export/odt.ts zeroes odf-kit's Standard style to match). */
+.paper .tiptap p {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+/* One paragraph opting out of the document's automatic hyphenation (pageBreak.ts).
+   The host carries `hyphens: auto`, so only the paragraph has to say no. */
+.paper .tiptap [data-no-hyphenation] {
+  hyphens: none;
+}
+
+/* A page-anchored frame is placed from its page corner and is out of the flow, so the
+   paragraph the importer hoists it into reserves no space (image.ts). !important: several
+   other paragraph rules below set their own `position: relative` (line-height shift, the
+   trailing-break spacer) — any of those would make this paragraph the frame's containing
+   block instead of the page, offsetting it by a page margin. */
+.paper .tiptap p:has(> [data-anchor-page]) {
+  height: 0;
+  margin: 0;
+  position: static !important;
+}
+
+/* Paragraph "colored field" + rule line (paragraphBox.ts). Background-color and per-side
+   borders are inline styles from renderHTML; a bordered block gets a little padding so the
+   text doesn't touch the rule (matches LibreOffice's fo:padding on such paragraphs). */
+.paper .tiptap [data-pborder-top],
+.paper .tiptap [data-pborder-bottom],
+.paper .tiptap [data-pborder-left],
+.paper .tiptap [data-pborder-right] {
+  padding: 0.04cm 0.08cm;
+}
+
+/* Both exporters write style:text-position="super 58%": that size, and a zero line
+   height so the raised run stays out of the line box, as it does in LibreOffice. On
+   the paper, not the body — a header/footer zone carries the marks and is reserved. */
+.paper :is(sup, sub) {
+  font-size: 58%;
+  line-height: 0;
+}
+
+/* Hyperlinks (link.ts). Ctrl/Cmd+click opens them (Editor.svelte). */
+/* The browser's own link colour is off first: a link Word left unstyled is drawn like the
+   text around it, since there the blue is a character style, not a property of being a
+   link (link.ts). Every other link — ODF paints them all — takes the visual back. */
+.paper .tiptap a {
+  color: inherit;
+  text-decoration: none;
+  cursor: text;
+}
+.paper .tiptap a:not([data-plain]) {
+  color: #1a56db;
+  text-decoration: underline;
+}
+
+/* Find & Replace match highlights (searchReplace.ts); current match is stronger. */
+.paper .tiptap .search-match {
+  background: rgba(255, 213, 0, 0.45);
+  border-radius: 2px;
+}
+.paper .tiptap .search-match-current {
+  background: rgba(255, 145, 0, 0.8);
+}
+
+/* A ruby annotation (ruby.ts). The reading sits above its base at half its size,
+   which is what both word processors print and what `w:hps` says. */
+.paper .tiptap ruby {
+  ruby-position: over;
+}
+.paper .tiptap ruby rt {
+  font-size: 0.5em;
+  line-height: 1;
+}
+
+/* The word being offered (wordCompletion.ts): after the caret, in the text's own
+   font, greyed — it is not in the document until Enter takes it. */
+.paper .tiptap .word-completion {
+  opacity: 0.45;
+  user-select: none;
+}
+
+/* Generated table of contents (tableOfContents.ts). A non-editable block listing
+   headings with dot leaders to their live page number; entries are clickable. */
+.paper .tiptap .toc {
+  margin: 0 var(--sec-inset-right, 0px) 0.5cm var(--sec-inset-left, 0px);
+  user-select: none;
+  cursor: default;
+}
+.paper .tiptap .toc-title {
+  font-size: 16pt;
+  font-weight: bold;
+  margin-bottom: 0.3cm;
+}
+.paper .tiptap .toc-empty {
+  font-style: italic;
+  opacity: 0.6;
+}
+.paper .tiptap .toc-entry {
+  display: flex;
+  /* The last one: an entry whose heading carries a hard break is several lines, and the
+     leader and page number belong beside the last of them. */
+  align-items: last baseline;
+  cursor: pointer;
+}
+.paper .tiptap .toc-entry:hover .toc-text {
+  text-decoration: underline;
+}
+/* One level = 0.5cm, the indent LibreOffice's own Contents 1…5 styles carry — the
+   fallback for an index whose file names no per-level style (that one brings its own). */
+.paper .tiptap .toc-level-2:not([data-style]) { padding-left: 0.5cm; }
+.paper .tiptap .toc-level-3:not([data-style]) { padding-left: 1cm; }
+.paper .tiptap .toc-level-4:not([data-style]) { padding-left: 1.5cm; }
+.paper .tiptap .toc-level-5:not([data-style]) { padding-left: 2cm; }
+/* An entry longer than the row wraps and the leader follows its last line, which is
+   where `align-items: last baseline` puts it — a word processor never truncates one. */
+.paper .tiptap .toc-text {
+  flex: 0 1 auto;
+}
+/* Leader dots filling the gap: the row grants the span the space that is left and
+   clips the dots that do not fit, so the page number stays put. */
+.paper .tiptap .toc-leader {
+  flex: 1 1 0; /* basis 0: the dots are decoration, they must not size the row */
+  min-width: 1em;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.paper .tiptap .toc-page {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* Footnotes and endnotes (notes.ts). Sizes and indents are LibreOffice's own Footnote
+   style; the separator values follow its style:footnote-sep — see
+   docs/architecture/notes.md, all of them probed. The dialog overrides them on :root. */
+/* Registered, so getComputedStyle resolves them to px: pageBreaks.ts reserves the
+   separator's own band out of the page and an unregistered var reads back as "0.1cm". */
+@property --note-sep-above { syntax: '<length>'; inherits: true; initial-value: 0.1cm; }
+@property --note-sep-weight { syntax: '<length>'; inherits: true; initial-value: 0.5pt; }
+@property --note-sep-below { syntax: '<length>'; inherits: true; initial-value: 0.1cm; }
+.paper .tiptap .note-ref {
+  /* style:text-position="super 58%" on LibreOffice's Footnote anchor style. */
+  vertical-align: super;
+  font-size: 58%;
+  line-height: 0;
+  cursor: pointer;
+}
+/* Padding, not a margin, for the hanging indent: the box then still spans the whole
+   text width, which is what the separator's 25% is measured against. LibreOffice's own
+   Footnote style, and only for a note whose file names none of its own. */
+.paper .tiptap .note {
+  padding-left: 0.6cm;
+  text-indent: -0.6cm;
+}
+.paper .tiptap .note:not([data-style]) {
+  font-size: 10pt;
+}
+/* The note's own marker is plain text at the baseline — LibreOffice's Footnote Symbol
+   style carries nothing, only the anchor is raised. An inline-block the width of the
+   hanging indent stands in for the tab LibreOffice puts after it. */
+.paper .tiptap .note-marker {
+  display: inline-block;
+  min-width: 0.6cm;
+  text-indent: 0;
+}
+/* A note style declares its indent as a hanging pair (fo:margin-left with a negative
+   fo:text-indent) and the style model has no first-line half, so its margin alone would
+   just push the note right. The hanging pair stays LibreOffice's; the font, size and
+   colour are the file's. */
+.paper .tiptap .note[data-style] {
+  margin-left: 0;
+  margin-right: 0;
+}
+/* A footnote is lifted out of the flow to the foot of its anchor's page; pageBreaks.ts
+   sets `top` in document px and marks the first note of each page. The margin custom
+   properties are .tiptap's own, so the box spans exactly the text width. */
+.paper .tiptap .note[data-note-kind='footnote'] {
+  position: absolute;
+  left: var(--page-margin-left);
+  right: var(--page-margin-right);
+}
+/* Collected at the end of the document instead (noteSettings.ts): the footnotes rejoin
+   the flow and open their own page, where the endnote list also starts. */
+:root[data-collect-footnotes] .paper .tiptap .note[data-note-kind='footnote'] {
+  position: static;
+}
+/* The separator hangs above the first note of a page, inside the band pageBreaks.ts
+   already reserved for it — so it costs the note's own box no height, which is what
+   keeps that height out of the reservation that produced it. A gradient, not a
+   border-top, because the line is only a quarter of the text width. */
+.paper .tiptap .note[data-note-page-first]::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(-1 * (var(--note-sep-weight) + var(--note-sep-below)));
+  /* Drawn at least one device pixel: 0.5pt is 0.66px, which Chromium rounds away to
+     nothing. The reservation above still uses the true weight, as a hairline border
+     does — the line is a pixel wider than it measures, not the space it sits in. */
+  height: max(1px, var(--note-sep-weight));
+  /* The two non-length values carry their own default: only a registered property
+     takes one from @property, and the dialog writes all of them onto :root. */
+  background-image: linear-gradient(var(--note-sep-color, #000), var(--note-sep-color, #000));
+  background-size: var(--note-sep-rel-width, 25%) 100%;
+  background-repeat: no-repeat;
+  background-position: var(--note-sep-align, left) top;
+}
+
+/* Formulas (formula.ts). MathML needs a font with an OpenType MATH table or Chromium
+   drops ∑/ϕ and won't stretch brackets — STIX Two Math is bundled for that. */
+/* The family must be set on <math> itself: the UA stylesheet declares
+   `math { font-family: math }` on the element, and an inherited value never beats it. */
+.paper .tiptap .formula math {
+  font-family: 'STIX Two Math', math, serif;
+  font-style: normal;
+}
+/* Baseline, not middle: an inline formula sits on the text baseline in LibreOffice and
+   Word, and MathML already carries the right baseline for its own box. */
+.paper .tiptap span.formula {
+  display: inline-block;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+/* A display formula owns its line, centered, as in LibreOffice and Word. */
+.paper .tiptap span.formula[data-display='true'] {
+  display: block;
+  text-align: center;
+}
+.paper .tiptap span.formula.selected {
+  outline: 2px solid var(--color-primary, #52748b);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+/* Inline, as-character images (image.ts). The wrapper reserves the rotated bounding
+   box; the rotor holds the <img>, resize handles and rotate grip, rotating together. */
+.paper .tiptap .image-node {
+  position: relative;
+  display: inline-block;
+  /* An as-char frame stands on the text baseline in LibreOffice and Word alike; the
+     file may say otherwise, and image.ts then overrides this per frame. */
+  vertical-align: baseline;
+  line-height: 0;
+}
+/* Alone on its line (image.ts marks the frame) it sets the line height by itself: no
+   descent hangs below it, and every vertical-pos but `offset` is moot (probed). Beats
+   the node view's own inline alignment, which has no other way to know. */
+.paper .tiptap .image-node.image-line:not([data-v-align='offset']) {
+  vertical-align: bottom !important;
+}
+/* While selected, lift the node (and its handles) above the header/footer layer
+   (z-index 22) so a rotate/resize handle poking into a margin stays grabbable. */
+.paper .tiptap .image-node.image-selected {
+  z-index: 25;
+}
+/* A block after a float keeps its own box over the float — only its lines move out of
+   the way — so the block on top swallows every click meant for the frame. Nothing is
+   hidden by lifting it: text flows beside a frame, never across it. A page-anchored
+   one is excluded, since it carries its own place in the stack (image.ts). */
+.paper .tiptap .image-node[data-wrap]:not([data-anchor-page]) {
+  z-index: 1;
+}
+/* No text beside a band means the next block too, or a short one would slot into the
+   clearance gap above the sunk float; a spacer starts a new page, and a block holding
+   the partner frame (wrapAlign pair) shares the band. image.ts writes the attribute. */
+.paper .tiptap [data-wrap-band='true'] + :not([data-page-break-spacer], [data-wrap-band]) {
+  clear: both;
+}
+.paper .tiptap .image-rotor {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+.paper .tiptap .image-rotor img {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.paper .tiptap .image-node.image-selected .image-rotor img {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+.paper .tiptap .image-resize-handle {
+  display: none;
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: var(--color-primary);
+  border: 1px solid #fff;
+  border-radius: 50%;
+  z-index: 30;
+}
+.paper .tiptap .image-node.image-selected .image-resize-handle,
+.paper .tiptap .image-node.image-selected .image-rotate-handle,
+.paper .tiptap .textbox-node.textbox-selected .image-resize-handle,
+.paper .tiptap .textbox-node.textbox-selected .image-rotate-handle,
+.paper .tiptap .textbox-node.textbox-active .image-resize-handle,
+.paper .tiptap .textbox-node.textbox-active .image-rotate-handle {
+  display: block;
+}
+.paper .tiptap .image-resize-nw { top: -5px; left: -5px; cursor: nwse-resize; }
+.paper .tiptap .image-resize-n  { top: -5px; left: 50%; margin-left: -5px; cursor: ns-resize; }
+.paper .tiptap .image-resize-ne { top: -5px; right: -5px; cursor: nesw-resize; }
+.paper .tiptap .image-resize-e  { top: 50%; right: -5px; margin-top: -5px; cursor: ew-resize; }
+.paper .tiptap .image-resize-se { bottom: -5px; right: -5px; cursor: nwse-resize; }
+.paper .tiptap .image-resize-s  { bottom: -5px; left: 50%; margin-left: -5px; cursor: ns-resize; }
+.paper .tiptap .image-resize-sw { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.paper .tiptap .image-resize-w  { top: 50%; left: -5px; margin-top: -5px; cursor: ew-resize; }
+/* Rotate grip floats above top-centre with a short connector line; the icon is a
+   circular rotation arrow. */
+.paper .tiptap .image-rotate-handle {
+  display: none;
+  position: absolute;
+  top: -28px;
+  left: 50%;
+  width: 16px;
+  height: 16px;
+  margin-left: -8px;
+  background: #fff center / 11px 11px no-repeat
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2352748b' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 12a9 9 0 1 1-2.6-6.4'/%3E%3Cpath d='M21 4v5h-5'/%3E%3C/svg%3E");
+  border: 1px solid var(--color-primary);
+  border-radius: 50%;
+  cursor: grab;
+  z-index: 31;
+}
+.paper .tiptap .image-rotate-handle::before {
+  content: '';
+  position: absolute;
+  top: 15px;
+  left: 50%;
+  width: 1px;
+  height: 13px;
+  margin-left: -0.5px;
+  background: var(--color-primary);
+}
+/* Live size readout while resizing. */
+.paper .tiptap .image-size-badge {
+  display: none;
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 2px 7px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 32;
+}
+
+/* Text boxes / shapes (textBox.ts). Same wrapper/rotor split as images: the wrapper
+   reserves the rotated bounding box, the rotor carries fill/stroke/rotation and the
+   shared image-* handles; .textbox-content is the editable area. */
+.paper .tiptap .textbox-node {
+  position: relative;
+}
+.paper .tiptap .textbox-node.textbox-selected,
+.paper .tiptap .textbox-node.textbox-active {
+  z-index: 25;
+}
+.paper .tiptap .textbox-rotor {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  box-sizing: border-box;
+  transform: translate(-50%, -50%);
+}
+.paper .tiptap .textbox-node.textbox-selected .textbox-rotor,
+.paper .tiptap .textbox-node.textbox-active .textbox-rotor {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+/* Grab affordance on the frame edge (outside the text area). */
+.paper .tiptap .textbox-rotor {
+  cursor: move;
+}
+/* The outline of a shape CSS can't draw, behind the text. Such a frame carries no
+   padding of its own (the text inset moves to .textbox-content), so the padding box
+   this covers is the frame. overflow stays visible or the stroke is clipped in half
+   at the viewBox edge. */
+.paper .tiptap .textbox-outline {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+/* A line is drawn in the frame's own pixels, so the SVG carries no stretching; it
+   still overflows, since half the stroke sits outside a frame of no height. */
+.paper .tiptap .textbox-line {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+.paper .tiptap .textbox-content {
+  cursor: text;
+  min-height: 1em;
+  position: relative;
+}
+.paper .tiptap .textbox-content > :first-child {
+  margin-top: 0;
+  padding-top: 0;
+}
+.paper .tiptap .textbox-content > :last-child {
+  margin-bottom: 0;
+}
+
+/* Multi-column section (columns.ts); column-count/gap come from the node's
+   inline style. Balanced fill matches ODF/Word section behavior; no visual
+   affordance — the section must read as plain flowing text. */
+.paper .tiptap .columns-node {
+  column-fill: balance;
+}
+/* Its first block sits flush with the column top — the space above it is dropped there,
+   as at a page top (probed: LibreOffice starts both columns level). Zeroing the property
+   the two spacing models read beats the block's own inline value, which a margin wouldn't. */
+.paper .tiptap .columns-node > :first-child {
+  --space-before: 0 !important;
+  margin-top: 0;
+  padding-top: 0;
+}
+.paper .tiptap .columns-node > :last-child {
+  margin-bottom: 0;
+}
+/* Inside the section the space above is a margin and the space below padding: every
+   engine truncates a margin at a column break but keeps padding, so each column starts
+   level (probed: LibreOffice does) and the two spacings still add up. */
+.paper:not([data-spacing-model='max']) .tiptap .columns-node :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10) {
+  padding-top: 0;
+  margin-top: var(--space-before);
+  margin-bottom: 0 !important;
+  padding-bottom: var(--space-after, 0);
+}
+/* A heading stays with the text it introduces across a column break, as it does
+   across a page break (keep-with-next is implied for headings in both products). */
+.paper .tiptap .columns-node :is(h1, h2, h3, h4, h5, h6, h7, h8, h9, h10) {
+  break-after: avoid;
+}
+
+/* A tab stop's leader fills the gap the tab was given as margin-left. The span is
+   zero-width (tab-size:0), so its right padding edge is where the stop sits. Not scoped
+   to .tiptap: a static header/footer zone carries the same spans. */
+.paper .tab-leader {
+  position: relative;
+}
+.paper .tab-leader::before {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: var(--leader-w, 0);
+  overflow: hidden;
+  white-space: pre;
+  line-height: inherit;
+  pointer-events: none;
+  /* Long enough to outrun any gap A4 can hold; the box clips the rest. */
+  content: '................................................................................................................................................................................................................';
+}
+.paper .tab-leader[data-leader='-']::before {
+  content: '----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------';
+}
+.paper .tab-leader[data-leader='_']::before {
+  content: '____________________________________________________________________________________________________________________________________________________________________________________________________________';
+}
+.paper .tab-leader[data-leader='·']::before {
+  content: '····································································································································································································································';
+}
+
+/* The document's own tab interval (storage/tabInterval.ts), LibreOffice's by default. */
+.paper .tiptap {
+  tab-size: var(--tab-interval, 1.25cm);
+  /* prosemirror-view sets `break-spaces`, which forbids a line-end space from
+     hanging into the margin, so lines break one word earlier than in
+     Word/LibreOffice. `pre-wrap` lets it hang, as they do. */
+  white-space: pre-wrap;
+  /* A word too long for its line (a URL, a German compound) is broken by Word and
+     LibreOffice rather than run past the margin. `break-word`, not `anywhere`, so a
+     table column's min-content width is still the longest word. */
+  overflow-wrap: break-word;
+}
+
+.paper .tiptap :is(h1, h2, h3, h4, h5, h6, h7, h8, h9, h10) {
+  /* Neutral base: font, size and margins come from the named paragraph styles
+     (styles/styleSheet.ts → the #document-styles element Editor.svelte writes).
+     HTML stops at h6, so 7–10 are unknown elements — inline until told otherwise. */
+  display: block;
+  font: inherit;
+  margin: 0 var(--sec-inset-right, 0px) 0 var(--sec-inset-left, 0px);
+}
+
+/* Space above a block. LibreOffice adds it to the space below the block above, which CSS
+   margins can't do (they collapse to the larger) — so it renders as padding. A Word
+   document takes the larger, LibreOffice included, and gets a margin instead. */
+@property --space-before {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0;
+}
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, .toc, .toc-title, .toc-entry) {
+  padding-top: var(--space-before);
+}
+.paper[data-spacing-model='max'] .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, .toc, .toc-title, .toc-entry) {
+  padding-top: 0;
+  margin-top: var(--space-before);
+}
+/* LibreOffice adds no space above the first block of a table cell (measured; its
+   AddParaTableSpacingAtStart), Word does — so it follows the document's spacing model. */
+.paper:not([data-spacing-model='max']) .tiptap :is(td, th) > :first-child {
+  padding-top: 0;
+  margin-top: 0;
+}
+
+/* The line box: the paragraph's spacing factor times its font's natural line height.
+   Either half may come from the style rule or, nearer, from the block's own attrs
+   (lineHeight.ts / blockFontSize.ts) — multiplying them here is what keeps both. */
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, li, .toc-entry) {
+  line-height: calc(var(--line-factor) * var(--natural-line));
+}
+
+/* A spacing above single puts all of its extra leading *below* each line (measured in
+   LibreOffice); CSS splits it half above. Shifting the block up by that half draws its
+   lines where LibreOffice does and leaves the flow — so pagination — untouched. */
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10) {
+  position: relative;
+  top: calc((1 - var(--line-factor)) * var(--natural-line) * 0.5em);
+}
+
+.paper .tiptap ul,
+.paper .tiptap ol {
+  /* One level = LIST_LEFT_STEP_CM (export/docx.ts, and the 1.27cm base the ODT list
+     styles use), so the on-screen item text sits where both exports place it. */
+  padding-left: 1.27cm;
+  margin-top: 0;
+  /* Matches the exported List_20_* styles, which inherit Standard's zeroed margin. */
+  margin-bottom: 0;
+}
+
+/* The marker is drawn by the item block's ::before, not by ::marker, because Word and
+   LibreOffice put it at the level's hanging indent (LIST_HANGING_CM 0.635cm, which both
+   exports write) and CSS gives ::marker no position — Chromium sets it flush against the
+   text, ~4mm to the right. `list-style: none` only drops the marker box; the li stays a
+   list-item, so the list-item counter and <ol start> keep working. */
+.paper .tiptap li {
+  list-style: none;
+}
+
+/* The containing block for the right-aligned marker below, which stays absolute. */
+.paper .tiptap li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10) {
+  position: relative;
+}
+
+/* Floated, so the marker never grows the line box (in flow it grew every list line by a
+   pixel, which cost a fixture a page) yet a label wider than the hanging indent pushes
+   the first line right instead of printing under it, as both word processors do. */
+.paper .tiptap li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  float: left;
+  min-width: 0.635cm;
+  margin-left: -0.635cm;
+  white-space: pre;
+  line-height: inherit;
+  /* The marker follows the item's first text portion (listMarker.ts sets the custom
+     properties on the <li>, which the block inherits). */
+  font-family: var(--marker-family, inherit);
+  font-weight: var(--marker-weight, inherit);
+  font-style: var(--marker-style, inherit);
+  font-size: var(--marker-size, inherit);
+  color: var(--marker-color, inherit);
+}
+
+/* A label set against the far end of the hanging indent grows into the margin instead
+   of into the text — what keeps Word's Roman numerals off the words they label. */
+.paper .tiptap :is(ol, ul)[data-marker-align="right"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  float: none;
+  position: absolute;
+  top: 0;
+  min-width: 0;
+  margin-left: 0;
+  right: calc(100% + 0.635cm);
+}
+
+/* Ordered numbering, keyed by data-eff-list-style — the effective numbering
+   listStyle.ts's plugin resolves per list from its attr + style + ancestor chain. A <ul>
+   carries it too where a named style's level numbers that depth. The undecorated <ol>
+   is the plain decimal fallback and must come first. */
+.paper .tiptap ol > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before                                { content: counter(list-item, decimal) ". "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="decimal"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before  { content: counter(list-item, decimal) ". "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="decimal-paren"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before     { content: counter(list-item, decimal) ") "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="lower-alpha"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before       { content: counter(list-item, lower-alpha) ". "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="lower-alpha-paren"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, lower-alpha) ") "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="upper-alpha"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before       { content: counter(list-item, upper-alpha) ". "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="upper-alpha-paren"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, upper-alpha) ") "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="lower-roman"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before       { content: counter(list-item, lower-roman) ". "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="lower-roman-paren"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, lower-roman) ") "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="upper-roman"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before       { content: counter(list-item, upper-roman) ". "; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="upper-roman-paren"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, upper-roman) ") "; }
+
+/* Chinese numbering. The first three counter styles are CSS's own and render what
+   LibreOffice renders (probed); the circled digits need a style of their own. */
+.paper .tiptap :is(ol, ul)[data-eff-list-style="cjk-counting"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, simp-chinese-informal) "、"; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="cjk-legal"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, simp-chinese-formal) "、"; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="cjk-stem"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, edt-stem) "、"; }
+.paper .tiptap :is(ol, ul)[data-eff-list-style="circled-decimal"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: counter(list-item, edt-circled) " "; }
+
+/* Both styles run out and then number on in decimal, which is what LibreOffice does and
+   what formatOrdinal writes into a PDF — CSS's own cjk-heavenly-stem would instead carry
+   on in cjk-decimal (一一 for 11), and the circled digits reach ㊿ before giving up. */
+@counter-style edt-stem {
+  system: fixed 1;
+  symbols: "甲" "乙" "丙" "丁" "戊" "己" "庚" "辛" "壬" "癸";
+  suffix: "";
+}
+
+@counter-style edt-circled {
+  system: fixed 1;
+  symbols: "①" "②" "③" "④" "⑤" "⑥" "⑦" "⑧" "⑨" "⑩" "⑪" "⑫" "⑬" "⑭" "⑮" "⑯" "⑰" "⑱" "⑲" "⑳" "㉑" "㉒" "㉓" "㉔" "㉕" "㉖" "㉗" "㉘" "㉙" "㉚" "㉛" "㉜" "㉝" "㉞" "㉟" "㊱" "㊲" "㊳" "㊴" "㊵" "㊶" "㊷" "㊸" "㊹" "㊺" "㊻" "㊼" "㊽" "㊾" "㊿";
+  suffix: "";
+}
+
+/* Legal/outline numbering (1., 1.1., 1.2.1. …): the plugin tags the multilevel list and
+   every attr-less member of its chain with data-eff-list-style="multilevel". */
+.paper .tiptap :is(ol, ul)[data-eff-list-style="multilevel"] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  content: counters(list-item, ".") ". ";
+}
+
+/* A numbered <ul> depth keeps the ordered markers' font (the symbol-shim rule below
+   would set the digits in the serif fallback instead of the item's own font). */
+.paper .tiptap ul[data-eff-list-style] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  font-family: var(--marker-family, inherit);
+}
+
+/* Default bullet markers per nesting depth — the same cycle the ODT/DOCX export writes
+   (DEFAULT_BULLET_CYCLE in bulletListTypes.ts). The bundled symbol shim comes first: it
+   holds only the glyphs Liberation Serif lacks (❖ ➢ ⇨ ✓ ▸ ◆), so those stay compact and
+   platform-independent while every other char falls through to the text font. */
+.paper .tiptap ul > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  content: '• ';
+  font-family: 'EdenText Symbols', var(--marker-family, var(--font-serif)), serif;
+}
+.paper .tiptap ul ul > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before             { content: '◦ '; }
+.paper .tiptap ul ul ul > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before          { content: '▪ '; }
+.paper .tiptap ul ul ul ul > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before       { content: '▸ '; }
+.paper .tiptap ul ul ul ul ul > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before    { content: '– '; }
+.paper .tiptap ul ul ul ul ul ul > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before { content: '· '; }
+
+/* A list's own `bulletChar` beats the cycle at any depth — an attribute outranks the
+   descendant chain. A nested list without one keeps its depth's char, which is what both
+   exports write, even though --bullet inherits into it. An <ol> carries data-bullet where
+   a named style's level bullets that depth; the shim font rides along for its glyphs. */
+.paper .tiptap :is(ul, ol)[data-bullet] > li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  content: var(--bullet) ' ';
+  font-family: 'EdenText Symbols', var(--marker-family, var(--font-serif)), serif;
+}
+
+/* The PDF clone (the .paper itself) replaces every marker with a real span (pdf.ts).
+   `!important` because the per-numbering rules above are one attribute more specific,
+   and html2canvas prints what it cannot count — `counters()` as its bare separator. */
+.paper.pdf-list-markers li > :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::before {
+  content: none !important;
+}
+
+.paper .tiptap li {
+  margin-top: 0;
+  margin-bottom: 0;
+  }
+
+  .paper .tiptap li p {
+    margin-bottom: 0;
+}
+
+/* Tables. The visual border/padding must match the ODT export so the editor
+   and the exported .odt look identical (see export/odt.ts CUST_TABLE handler):
+     • border  → export emits 0.5pt solid #000000; 1px solid renders crisply
+       on screen and is the visual equivalent of a thin 0.5pt line.
+     • padding → Word's/LibreOffice's cell margins. The fallback below is Word's
+       own default; a file's own value rides --cell-pad (tableCellPadding.ts).
+   Tables are wrapped in <div class="tableWrapper"> by TipTap's node view. */
+.paper .tiptap .tableWrapper {
+  /* Default is flush with the text area; a dragged outer edge sets an inline
+     margin-left/-right here (tableView.ts), which is what the export writes. */
+  margin: 0;
+  overflow-x: auto;
+  /* The table's space above adds to the block above it, as a paragraph's does. */
+  padding-top: var(--space-before);
+}
+.paper[data-spacing-model='max'] .tiptap .tableWrapper {
+  padding-top: 0;
+  margin-top: var(--space-before);
+}
+
+.paper .tiptap table {
+  width: 100%;
+  /* fixed layout → the per-column <col> percentage widths from the custom node
+     view (tableView.ts) are authoritative; width:100% keeps the table the full
+     text width, matching the ODT export (export/odt.ts emits per-column widths
+     summing to the text width with table:align="margins"). */
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.paper .tiptap td,
+.paper .tiptap th {
+  border: 1px solid #000;
+  padding: var(--cell-pad-t, 0) var(--cell-pad-r, 0.19cm) var(--cell-pad-b, 0) var(--cell-pad-l, 0.19cm);
+  /* A painted border is a whole pixel wide whatever the file declares, so the excess
+     comes off the padding — else a long table grows a line every few rows
+     (tableCellBorders.ts). Below first, then what is left of it above. */
+  padding-bottom: max(0px, calc(var(--cell-pad-b, 0px) - var(--border-over, 0px)));
+  padding-top: max(0px, calc(
+    var(--cell-pad-t, 0px) - max(0px, var(--border-over, 0px) - var(--cell-pad-b, 0px))));
+  vertical-align: top;
+  /* A repeating header row is a <th>, and no word processor centres or bolds its text
+     for that reason — drop the two UA defaults so the cell follows its own style. */
+  text-align: inherit;
+  font-weight: inherit;
+  /* Positioning context for the column-resize handle widget (a child div the
+     resize plugin places at the cell's right edge). */
+  position: relative;
+}
+
+/* No space below a cell paragraph that names no style: LibreOffice's Table Contents and
+   Word's table styles both zero it, and the space would fill the cell, leaving vertical
+   alignment no slack. An inline value (direct formatting) still wins. */
+.paper .tiptap :is(td, th) > p:not([data-style]) {
+  margin-bottom: 0;
+}
+/* Only LibreOffice's style zeroes the space above too; Word's table styles set the
+   spacing after alone, so a Word document keeps it (as the cell-start rule above does). */
+.paper:not([data-spacing-model='max']) .tiptap :is(td, th) > p:not([data-style]) {
+  --space-before: 0;
+}
+
+/* Header-row cells (tableHeaderRow.ts toggle): bold rendered presentationally so all
+   text — existing, typed, or pasted — is bold. The light fill comes from the cell's
+   inline background-color; export bakes the bold for Word/LibreOffice consistency. */
+.paper .tiptap td.cell-header,
+.paper .tiptap th.cell-header {
+  font-weight: 600;
+}
+
+/* Selected-cell highlight while editing (ProseMirror tables add .selectedCell).
+   A translucent overlay via the ::after avoids disturbing the cell border. */
+.paper .tiptap .selectedCell {
+  position: relative;
+}
+
+.paper .tiptap .selectedCell::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--color-primary);
+  opacity: 0.12;
+  pointer-events: none;
+}
+
+/* Column resize (tableColumnResize.ts). The handle is a widget the plugin places
+   at a cell's right edge when the pointer is near an internal column border; the
+   plugin reads the pointer position itself, so the handle ignores pointer events.
+   `.resize-cursor` is toggled on the whole editor while a border is active. */
+.paper .tiptap.resize-cursor {
+  cursor: col-resize;
+}
+
+.paper .tiptap .column-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  z-index: 20;
+  background: var(--color-primary);
+  pointer-events: none;
+}
+
+/* The table's outer left edge: same handle, mirrored to the cell's left side. */
+.paper .tiptap .column-resize-handle.left {
+  left: -2px;
+  right: auto;
+}
+
+.paper .tiptap .column-resize-dragging {
+  /* Suppress text-selection flicker while dragging a column border. */
+  user-select: none;
+}
+
+/* Row resize (tableRowResize.ts). Mirrors the column handle but sits at a cell's
+   lower edge; one handle per cell forms a continuous line across the active row.
+   `.row-resize-cursor` is toggled on the whole editor while a row border is active.
+   Column resize takes precedence at a corner, so the two never fight. */
+.paper .tiptap.row-resize-cursor {
+  cursor: row-resize;
+}
+
+.paper .tiptap .row-resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 4px;
+  z-index: 20;
+  background: var(--color-primary);
+  pointer-events: none;
+}
+
+.paper .tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: var(--color-text-muted);
+  pointer-events: none;
+  height: 0;
+}
+
+/* A template placeholder field: gray until replaced, as LibreOffice draws its own.
+   The sheet keeps its own colors through every theme, so the gray is fixed too. */
+.paper .tiptap span[data-placeholder-field] {
+  color: #808080;
+}
+.paper .tiptap span[data-placeholder-field].ProseMirror-selectednode {
+  background: color-mix(in srgb, var(--color-primary) 25%, transparent);
+  outline: none;
+}
+
+/* Paragraph mark (¶). Out of flow at its static position — after the last character,
+   but invisible to line breaking, so a line-end space still hangs into the margin and
+   the mark can never be pushed onto a line of its own. The toggle only recolors it. */
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::after {
+  content: '\00A0¶';
+  position: absolute;
+  display: inline-block;
+  width: 0;
+  height: 0;
+  /* Out of flow the glyph has no baseline to align to, so it needs a line box of the
+     block's own height to sit in — the static position gives it that line's top. */
+  line-height: inherit;
+  overflow: visible;
+  white-space: pre;
+  color: transparent;
+  opacity: 0.5;
+  font-family: var(--font-sans);
+  font-weight: 400;
+  user-select: none;
+  pointer-events: none;
+}
+
+.paper.show-formatting-marks .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::after {
+  color: var(--color-primary);
+}
+
+/* In a columns section the mark stays in flow: an out-of-flow pseudo whose containing
+   block sits inside a multicol makes Chromium give up balancing it (probed) — the whole
+   section then fills like one column. Zero width, so line breaking is unchanged. */
+.paper .tiptap .columns-node :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::after {
+  position: static;
+}
+/* Past a trailing BR an in-flow mark would open a second line and grow the block. */
+.paper .tiptap .columns-node :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10):has(> br.ProseMirror-trailingBreak)::after {
+  content: none;
+}
+
+/* After an inline atom ProseMirror's trailing-break BR adds a line the block has not
+   got, so a paragraph holding an image renders one too tall. Kept where the block really
+   does end in a break — bare, wrapped in the mark spans of the run that carried it, or
+   behind the floated marker the PDF clone injects (which leaves the block empty). */
+.paper .tiptap :not(br):not([data-pdf-marker]):not(:has(br:last-child)) + br.ProseMirror-trailingBreak {
+  display: none;
+}
+
+/* A block ProseMirror ends with a trailing-break BR — an empty one, or one ending in a
+   hard break — has its last line before that BR, not after it. */
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10):has(> br.ProseMirror-trailingBreak),
+.paper .tiptap li > p:has(> br.ProseMirror-trailingBreak) {
+  position: relative;
+}
+
+.paper .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10):has(> br.ProseMirror-trailingBreak)::after,
+.paper .tiptap li > p:has(> br.ProseMirror-trailingBreak)::after {
+  /* The static position would land past the BR, a line below the block; name the last
+     line instead — for an empty block that is also its first. */
+  top: calc(100% - 1lh);
+  left: 0;
+  margin-left: 0;
+}
+
+.paper.show-formatting-marks .tiptap .pm-space-mark {
+  position: relative;
+}
+
+.paper.show-formatting-marks .tiptap .pm-space-mark::before {
+  content: '·';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-primary);
+  opacity: 0.55;
+  font-weight: 700;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Tab marks: a → arrow overlaid at the start of the tab's width (the tab char
+   itself supplies the gap), mirroring Word/LibreOffice. */
+.paper.show-formatting-marks .tiptap .pm-tab-mark {
+  position: relative;
+}
+
+.paper.show-formatting-marks .tiptap .pm-tab-mark::before {
+  content: '→';
+  position: absolute;
+  left: 0.1em;
+  top: 0;
+  color: var(--color-primary);
+  opacity: 0.5;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Spell-check: red wavy underline under misspelled words (drawn by spellCheck.ts).
+   skip-ink:none keeps the wave continuous under descenders. */
+.tiptap .pm-spell-error {
+  text-decoration: red wavy underline;
+  text-decoration-skip-ink: none;
+}
+
+/* Grammar check: a blue wave, so a grammar finding reads apart from a spelling one. */
+.tiptap .pm-grammar-error {
+  text-decoration: #2b6cb0 wavy underline;
+  text-decoration-skip-ink: none;
+}
+
+/* A commented range, as Word paints it: a tinted band the text still reads through,
+   and a heavier tint on the one the pane has selected. A resolved comment keeps only a
+   faint underline, the way both word processors grey a handled one out. */
+.tiptap .pm-comment {
+  background: rgba(255, 200, 60, 0.28);
+  border-bottom: 1px solid rgba(200, 140, 0, 0.7);
+}
+
+/* The one the caret sits in (comment.ts): a heavier tint, so the pane's highlighted
+   card and the annotated text name each other. */
+.tiptap .pm-comment-active {
+  background: rgba(255, 200, 60, 0.5);
+}
+
+.tiptap .pm-comment[data-comment-resolved='true'] {
+  background: none;
+  border-bottom-color: rgba(140, 140, 140, 0.6);
+}
+
+/* Recorded revisions (trackChanges.ts). Both word processors underline an insertion
+   and strike a deletion, in the reviewer's colour; one colour here, since the editor
+   has a single author. */
+/* An index entry is a place, not text: a thin grey bar the way both word processors
+   shade a field, so it can be seen and deleted without taking room in the line. */
+.tiptap .pm-index-entry {
+  display: inline-block;
+  width: 3px;
+  height: 0.9em;
+  margin: 0 1px;
+  vertical-align: -0.05em;
+  border-radius: 1px;
+  background: var(--color-field-shade-strong);
+}
+
+/* A cell holding a formula shows its result on the field shade, since that result is
+   recomputed and typing over it does not last. Word draws the field the same way. */
+.tiptap :is(td, th)[data-formula] {
+  background-image: linear-gradient(var(--color-field-shade) 0 100%);
+}
+
+/* Every field sits on the grey field shade LibreOffice draws: none of it is typed text,
+   and the shade is what tells one from the text around it. Scoped to the page, not to
+   .tiptap, so a header/footer zone drawn as plain HTML shades its page number too. */
+.paper :is(.cross-ref, .pm-citation, [data-page-field], [data-datetime-field],
+           [data-seq], [data-placeholder-field]) {
+  background: var(--color-field-shade);
+  border-radius: 2px;
+}
+
+/* A reference whose target the file never carried shows its name instead, dimmed, so a
+   dangling one can be seen and removed instead of sitting there invisible. */
+.tiptap .cross-ref-broken {
+  opacity: 0.7;
+}
+
+/* A recorded revision. The mark only tints, so a DOM built without the decoration plugin
+   still shows one; the line comes from the decoration span ProseMirror nests INSIDE the
+   mark's, or an ancestor would draw it in the fallback colour instead of the author's. */
+.tiptap .pm-insertion,
+.tiptap .pm-deletion {
+  color: #c69200;
+}
+
+.tiptap .pm-rev-ins { text-decoration: underline; }
+.tiptap .pm-rev-del { text-decoration: line-through; }
+
+/* LibreOffice's author palette, handed out in order of first appearance (trackChanges.ts),
+   so several reviewers stay apart the way both word processors draw them. */
+.tiptap .pm-rev-a0 { color: #c69200; }
+.tiptap .pm-rev-a1 { color: #0646a2; }
+.tiptap .pm-rev-a2 { color: #579d1c; }
+.tiptap .pm-rev-a3 { color: #692b9d; }
+.tiptap .pm-rev-a4 { color: #c5000b; }
+.tiptap .pm-rev-a5 { color: #008080; }
+.tiptap .pm-rev-a6 { color: #8c8400; }
+.tiptap .pm-rev-a7 { color: #35556b; }
+.tiptap .pm-rev-a8 { color: #d17600; }
+
+/* Word's display modes (storage/markup.svelte.ts). The document keeps every change —
+   this only takes it off the page, so a final text or the original one can be read. */
+.paper[data-hide-deletions] .tiptap .pm-deletion,
+.paper[data-hide-insertions] .tiptap .pm-insertion { display: none; }
+
+/* What is left reads as plain text: the decoration that carries underline, strike and
+   author colour is off in these modes too (trackChanges.ts), the mark's tint is not. */
+.paper[data-plain-markup] .tiptap .pm-insertion,
+.paper[data-plain-markup] .tiptap .pm-deletion { color: inherit; }
+
+.paper[data-hide-comments] .tiptap .pm-comment,
+.paper[data-hide-comments] .tiptap .pm-comment-active {
+  background: none;
+  border-bottom: none;
+}
+
+/* Print styles: proper A4 pagination */
+@media print {
+  .editor {
+    padding: 0;
+    overflow: visible;
+  }
+
+  /* Never scale for print — the real page size comes from @page below. */
+  .paper-scaler {
+    width: auto;
+    height: auto;
+  }
+
+  /* The printout carries the margin bar and the comment list instead
+     (export/reviewPrint.ts); the balloons are a screen view. */
+  .review-margin-layer {
+    display: none;
+  }
+
+  .paper {
+    width: 100%;
+    max-width: none;
+    transform: none;
+    background: white !important;
+  }
+
+  .paper .tiptap {
+    background: none !important;
+    box-shadow: none;
+    border: none;
+    padding: 0;
+    min-height: auto;
+  }
+
+  /* Squiggles are an editing aid, never printed. */
+  .tiptap .pm-spell-error,
+  .tiptap .pm-grammar-error {
+    text-decoration: none;
+  }
+
+  .paper .tiptap > *[data-page-break] {
+    page-break-before: always;
+  }
+
+  @page {
+    size: A4;
+    margin: 25.4mm;
+  }
+
+  /* Hide the space/tab glyphs when printing (they're out-of-flow ::before, so removing
+     them changes nothing). The ¶ stays reserved but transparent so print pagination
+     matches the screen — removing it would reflow paragraphs it shares a full line with. */
+  .paper.show-formatting-marks .tiptap .pm-space-mark::before,
+  .paper.show-formatting-marks .tiptap .pm-tab-mark::before {
+    content: none;
+  }
+
+  .paper.show-formatting-marks .tiptap :is(p, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10)::after {
+    color: transparent;
+  }
+
+  /* The field shade is an editing aid; LibreOffice never puts it on paper either. */
+  .paper.field-shading {
+    --color-field-shade: transparent;
+    --color-field-shade-strong: transparent;
+  }
+}
+
+/* Fallback channel: drive color from the --font-color custom property so the
+   visible color survives even if ProseMirror's incremental DOM update leaves
+   a reused span with a stale `style` attribute that no longer contains
+   `color:`. The inline `color:` declaration still wins when present. */
+.tiptap [data-color] {
+  color: var(--font-color, currentColor);
+}
+
+/* allBlack theme: force all explicitly-colored text to the page text color.
+   The color is still stored on the textStyle mark, so .odt exports remain faithful. */
+[data-theme="allBlack"] .tiptap [data-color] {
+  color: var(--color-page-text) !important;
+}

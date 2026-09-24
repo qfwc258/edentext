@@ -1,0 +1,297 @@
+// Image formats, shared by both importers. An <img> renders only a fixed set, so the
+// rest (WMF/EMF/SVM/TIFF/…) is decoded client-side (convertUnsupportedImages) or skipped
+// with a warning. Resolved by extension, then by magic number so mislabels still work.
+import { unzipSync } from 'fflate';
+import { IMPORT_LIMITS, ImportLimitError } from './importLimits';
+
+const MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  apng: 'image/apng',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  jfif: 'image/jpeg',
+  pjpeg: 'image/jpeg',
+  pjp: 'image/jpeg',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  svg: 'image/svg+xml',
+  webp: 'image/webp',
+  avif: 'image/avif',
+  ico: 'image/x-icon',
+};
+
+export function imageExtOf(path: string): string {
+  const bare = path.split(/[?#]/)[0];
+  return bare.split('.').pop()?.toLowerCase() ?? '';
+}
+
+// A renderable mime from the magic number, or null (unknown/unrenderable). Only the
+// formats browsers display are recognised — a metafile/TIFF signature returns null.
+function sniffImageMime(bytes: Uint8Array): string | null {
+  const b = bytes;
+  if (b.length < 4) return null;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'image/gif';
+  if (b[0] === 0x42 && b[1] === 0x4d) return 'image/bmp';
+  if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return 'image/x-icon';
+  if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+    && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+  if (b.length >= 12 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
+    if (brand === 'avif' || brand === 'avis') return 'image/avif';
+  }
+  // SVG is XML text: look for an <svg root within the leading bytes.
+  const head = String.fromCharCode(...b.subarray(0, Math.min(b.length, 256))).toLowerCase();
+  if (head.includes('<svg')) return 'image/svg+xml';
+  return null;
+}
+
+// The mime to render `bytes` (from `path`) as, or null when the browser can't display
+// the format. Extension wins when renderable; otherwise the magic number is consulted.
+export function displayableImageMime(bytes: Uint8Array, path: string): string | null {
+  const byExt = MIME_BY_EXT[imageExtOf(path)];
+  if (byExt) return byExt;
+  return sniffImageMime(bytes);
+}
+
+type ToBase64 = { toBase64?: () => string };
+
+function bytesToBase64(bytes: Uint8Array): string {
+  // The native encoder where the browser has one — a picture-heavy file spends a
+  // quarter second in the loop below, which is only the fallback.
+  const native = (bytes as Uint8Array & ToBase64).toBase64;
+  if (native) return native.call(bytes);
+  let bin = '';
+  const chunk = 0x8000; // chunk so String.fromCharCode doesn't blow the call stack
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+// A JPEG's colour component count (4 = CMYK) and where its ICC profile segments sit.
+// Marker walk up to the scan; a segment is 0xFF, marker, 2-byte length, payload.
+function jpegHeader(b: Uint8Array): { components: number; icc: Array<[number, number]> } {
+  const icc: Array<[number, number]> = [];
+  let components = 0;
+  let i = 2;
+  while (i + 3 < b.length && b[i] === 0xff) {
+    const marker = b[i + 1];
+    if (marker === 0xd9 || marker === 0xda) break;
+    const len = (b[i + 2] << 8) | b[i + 3];
+    // SOF0…SOF15 (not the DHT/JPG/DAC markers sharing the range) carry the component count.
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      components = b[i + 9];
+    } else if (marker === 0xe2 && String.fromCharCode(...b.subarray(i + 4, i + 15)) === 'ICC_PROFILE') {
+      icc.push([i, i + 2 + len]);
+    }
+    i += 2 + len;
+  }
+  return { components, icc };
+}
+
+// Chromium colour-manages a CMYK JPEG through its embedded profile where LibreOffice and
+// Word convert it naively — measured on a CMYK logo: its blue arrived (0,80,131) against
+// LibreOffice's (0,32,183), its black as grey. Dropping the profile makes the two agree.
+export function stripCmykIccProfile(bytes: Uint8Array): Uint8Array {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return bytes;
+  const { components, icc } = jpegHeader(bytes);
+  if (components !== 4 || !icc.length) return bytes;
+  const out = new Uint8Array(bytes.length - icc.reduce((n, [from, to]) => n + (to - from), 0));
+  let at = 0;
+  let kept = 0;
+  for (const [from, to] of icc) {
+    out.set(bytes.subarray(kept, from), at);
+    at += from - kept;
+    kept = to;
+  }
+  out.set(bytes.subarray(kept), at);
+  return out;
+}
+
+// A base64 data-URI for a displayable image, or null when the format can't be shown.
+export function imageDataUrl(bytes: Uint8Array, path: string): string | null {
+  const mime = displayableImageMime(bytes, path);
+  if (!mime) return null;
+  return `data:${mime};base64,${bytesToBase64(mime === 'image/jpeg' ? stripCmykIccProfile(bytes) : bytes)}`;
+}
+
+// One inflate per opened file: the format pre-pass and the importer read the same
+// archive, and a picture-heavy one costs a quarter second per pass.
+const archives = new WeakMap<Uint8Array, Record<string, Uint8Array>>();
+
+export function unzipArchive(bytes: Uint8Array): Record<string, Uint8Array> {
+  const known = archives.get(bytes);
+  if (known) return known;
+  checkZipBudget(bytes);
+  const files = unzipSync(bytes);
+  archives.set(bytes, files);
+  return files;
+}
+
+// Inspect the central directory before fflate allocates any decompressed entries. ZIP64 is
+// deliberately refused here: its sentinel sizes cannot be bounded from these fields.
+function checkZipBudget(bytes: Uint8Array): void {
+  if (bytes.length > IMPORT_LIMITS.compressedBytes) throw new ImportLimitError('The document is too large to import safely.');
+  const start = Math.max(0, bytes.length - 0xffff - 22);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= start; i--) {
+    if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 5 && bytes[i + 3] === 6) { eocd = i; break; }
+  }
+  if (eocd < 0) return; // fflate reports a malformed archive consistently.
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint16(eocd + 10, true);
+  const size = view.getUint32(eocd + 12, true);
+  const offset = view.getUint32(eocd + 16, true);
+  if (count === 0xffff || size === 0xffffffff || offset === 0xffffffff || count > IMPORT_LIMITS.zipEntries || offset + size > bytes.length) {
+    throw new ImportLimitError('The document archive exceeds supported limits.');
+  }
+  let at = offset;
+  let total = 0;
+  for (let i = 0; i < count; i++) {
+    if (at + 46 > offset + size || view.getUint32(at, true) !== 0x02014b50) throw new ImportLimitError('The document archive is malformed.');
+    const compressed = view.getUint32(at + 20, true);
+    const uncompressed = view.getUint32(at + 24, true);
+    const name = view.getUint16(at + 28, true), extra = view.getUint16(at + 30, true), comment = view.getUint16(at + 32, true);
+    const path = new TextDecoder().decode(bytes.subarray(at + 46, at + 46 + name));
+    const partLimit = /\.xml$/i.test(path) ? IMPORT_LIMITS.xmlPartBytes
+      : looksLikeMedia(path) ? IMPORT_LIMITS.mediaPartBytes : IMPORT_LIMITS.zipEntryBytes;
+    if (uncompressed === 0xffffffff || compressed === 0xffffffff || uncompressed > IMPORT_LIMITS.zipEntryBytes
+      || uncompressed > partLimit
+      || (compressed && uncompressed / compressed > IMPORT_LIMITS.zipCompressionRatio)) throw new ImportLimitError('The document archive exceeds supported limits.');
+    total += uncompressed;
+    if (total > IMPORT_LIMITS.zipTotalBytes || at + 46 + name + extra + comment > offset + size) throw new ImportLimitError('The document archive exceeds supported limits.');
+    at += 46 + name + extra + comment;
+  }
+}
+
+// ---- client-side decoding of formats the browser can't render ----------------
+
+// A map from archive path to a decoded PNG data-URI, produced by the async pre-pass and
+// consulted by the synchronous importers before they read the raw bytes.
+export type ConvertedImages = Map<string, string>;
+
+// TIFF: 'II*\0' (little-endian) or 'MM\0*' (big-endian), or a .tif/.tiff extension.
+function isTiff(bytes: Uint8Array, path: string): boolean {
+  const ext = imageExtOf(path);
+  if (ext === 'tif' || ext === 'tiff') return true;
+  return bytes.length >= 4
+    && ((bytes[0] === 0x49 && bytes[1] === 0x49 && bytes[2] === 0x2a && bytes[3] === 0x00)
+      || (bytes[0] === 0x4d && bytes[1] === 0x4d && bytes[2] === 0x00 && bytes[3] === 0x2a));
+}
+
+// EMF: the record header's ' EMF' signature at byte 40, or a .emf extension.
+function isEmf(bytes: Uint8Array, path: string): boolean {
+  if (imageExtOf(path) === 'emf') return true;
+  return bytes.length >= 44 && new DataView(bytes.buffer, bytes.byteOffset, 44).getUint32(40, true) === 0x464d4520;
+}
+
+// True when the browser can't display the bytes directly but a lazy decoder can turn
+// them into something it can (see convertImageToDataUrl).
+export function isConvertibleImage(bytes: Uint8Array, path: string): boolean {
+  return displayableImageMime(bytes, path) === null && (isTiff(bytes, path) || isEmf(bytes, path));
+}
+
+// RGBA pixels → a PNG data-URI via an offscreen canvas (browser only, which is where
+// import runs). null when there's no 2D context or the dimensions are empty.
+function rgbaToPngDataUrl(rgba: Uint8Array, w: number, h: number): string | null {
+  if (!w || !h || !Number.isSafeInteger(w) || !Number.isSafeInteger(h)
+    || w * h > IMPORT_LIMITS.convertedImagePixels || rgba.length > IMPORT_LIMITS.convertedImageBytes
+    || rgba.length < w * h * 4) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const cctx = canvas.getContext('2d');
+  if (!cctx) return null;
+  cctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+  return canvas.toDataURL('image/png');
+}
+
+// Decode a convertible format to a PNG data-URI, lazy-loading the decoder so it never
+// enters the baseline bundle. null when it isn't convertible or decoding fails.
+export async function convertImageToDataUrl(bytes: Uint8Array, path: string): Promise<string | null> {
+  try {
+    if (isTiff(bytes, path)) {
+      const UTIF = await import('utif2');
+      // A fresh ArrayBuffer (not the possibly-shared source buffer) for UTIF's typing.
+      const buf = new Uint8Array(bytes).buffer;
+      const ifds = UTIF.decode(buf);
+      const first = ifds[0];
+      if (ifds.length > 100 || !first || !Number.isSafeInteger(first.width) || !Number.isSafeInteger(first.height)
+        || first.width <= 0 || first.height <= 0 || first.width * first.height > IMPORT_LIMITS.convertedImagePixels) return null;
+      UTIF.decodeImage(buf, first);
+      return rgbaToPngDataUrl(UTIF.toRGBA8(first), first.width, first.height);
+    }
+    if (isEmf(bytes, path)) {
+      const svg = (await import('./emf')).emfToSvg(bytes);
+      return svg ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}` : null;
+    }
+  } catch { /* corrupt/unsupported → the importer skips it with a warning */ }
+  return null;
+}
+
+// Only archive entries in an image folder (ODF Pictures/, DOCX word/media/) are probed.
+function looksLikeMedia(path: string): boolean {
+  return /(^|\/)(Pictures|media)\//i.test(path);
+}
+
+// Pre-decode every convertible image in an .odt/.docx archive to a PNG data-URI, so the
+// synchronous importer can resolve them. Lazy: the decoder is only imported when such an
+// image is actually present, so ordinary documents load with zero extra cost.
+export async function convertUnsupportedImages(bytes: Uint8Array): Promise<ConvertedImages> {
+  const out: ConvertedImages = new Map();
+  let files: Record<string, Uint8Array>;
+  try { files = unzipArchive(bytes); } catch { return out; }
+  for (const [path, data] of Object.entries(files)) {
+    if (!looksLikeMedia(path) || !isConvertibleImage(data, path)) continue;
+    const url = await convertImageToDataUrl(data, path);
+    if (url) out.set(path, url);
+  }
+  return out;
+}
+
+// A frame whose picture cannot be shown — a chart, a metafile — as a labelled box at
+// the drawing's own size, so the document keeps the space it reserves for it.
+export function placeholderImage(label: string, widthPx: number, heightPx: number): string {
+  const w = Math.max(8, Math.round(widthPx));
+  const h = Math.max(8, Math.round(heightPx));
+  const text = label.replace(/[<>&]/g, '');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`
+    + `<rect x="0.5" y="0.5" width="${w - 1}" height="${h - 1}" fill="#f4f4f5" stroke="#c2c2c8" stroke-dasharray="6 4"/>`
+    + `<text x="${w / 2}" y="${h / 2}" fill="#8a8a90" font-family="sans-serif" font-size="13"`
+    + ` text-anchor="middle" dominant-baseline="middle">${text}</text></svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+// Word reads no SVG — a vector picture goes into a .docx as pixels or not at all. The
+// browser is the only renderer at hand, so the export draws it onto a canvas; off the
+// main thread (the test suite) there is none and the caller keeps the vector.
+const SVG_RASTER_SCALE = 2; // the picture is placed at CSS px, so raster at 2× for print
+
+export function isSvgDataUrl(src: unknown): src is string {
+  return typeof src === 'string' && src.startsWith('data:image/svg+xml');
+}
+
+export async function svgToPngDataUrl(src: string, widthPx: number, heightPx: number): Promise<string | null> {
+  if (typeof document === 'undefined' || typeof Image === 'undefined') return null;
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(widthPx * SVG_RASTER_SCALE));
+    canvas.height = Math.max(1, Math.round(heightPx * SVG_RASTER_SCALE));
+    // Probed before the image is loaded, not after: jsdom has a document and an Image
+    // whose onload never fires for a data URI, and awaiting that one hangs the caller.
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    const img = new Image();
+    await new Promise<void>((ok, fail) => {
+      img.onload = () => ok();
+      img.onerror = () => fail(new Error('svg'));
+      img.src = src;
+    });
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/png');
+  } catch {
+    return null;
+  }
+}

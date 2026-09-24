@@ -1,0 +1,926 @@
+import { Node, mergeAttributes } from '@tiptap/core';
+import type { Editor } from '@tiptap/core';
+import type { Mark, Node as PMNode } from '@tiptap/pm/model';
+import { NodeSelection, Plugin, PluginKey } from '@tiptap/pm/state';
+import type { EditorState, Transaction } from '@tiptap/pm/state';
+import { Decoration, DecorationSet } from '@tiptap/pm/view';
+import type { EditorView } from '@tiptap/pm/view';
+import { dropCursor } from '@tiptap/pm/dropcursor';
+import { cmToPx } from '../../storage/pageMargins';
+import { readVerticalMargins, placeFromPage } from './pageBreaks';
+
+// Inline, as-character image, or a floating text-wrapped frame (wrap = flow mode);
+// width/height are doc px @96dpi, rotation CW degrees. Export → cm + ODF
+// draw:transform/style:wrap. A floating image floats at its anchor; drag re-anchors it.
+
+// 'inline' = as-character; 'left'/'right' = square wrap (text on the open side);
+// 'topBottom' = no side wrap (text only above/below); 'through' = the text runs over
+// or under it (`inFront` picks which), so the frame reserves nothing at all.
+export type WrapMode = 'inline' | 'left' | 'right' | 'topBottom' | 'through';
+
+declare module '@tiptap/core' {
+  interface Commands<ReturnType> {
+    image: {
+      setImage: (attrs: { src: string; alt?: string; width?: number | null; height?: number | null; rotation?: number; wrap?: WrapMode }) => ReturnType;
+      setImageWrap: (wrap: WrapMode, inFront?: boolean) => ReturnType;
+    };
+  }
+}
+
+export const MIN_SIZE_PX = 24;
+
+// Corners keep aspect; edges (n/s/e/w) change one dimension only.
+// Shared with textBox.ts, whose node view uses the same handle set.
+export const HANDLES: { k: string; x: -1 | 0 | 1; y: -1 | 0 | 1; aspect: boolean }[] = [
+  { k: 'nw', x: -1, y: -1, aspect: true },
+  { k: 'n', x: 0, y: -1, aspect: false },
+  { k: 'ne', x: 1, y: -1, aspect: true },
+  { k: 'e', x: 1, y: 0, aspect: false },
+  { k: 'se', x: 1, y: 1, aspect: true },
+  { k: 's', x: 0, y: 1, aspect: false },
+  { k: 'sw', x: -1, y: 1, aspect: true },
+  { k: 'w', x: -1, y: 0, aspect: false },
+];
+
+export function parsePx(value: string | null): number | null {
+  if (!value) return null;
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+function parseCm(value: string | null): number | null {
+  if (!value) return null;
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+export const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+// The page text width, live from the vars the editor maintains (margins/orientation).
+const COLUMN_WIDTH_CSS =
+  'calc(var(--user-page-width) - var(--user-margin-left) - var(--user-margin-right))';
+
+// An as-character image wider than the text column takes a line of its own and leaves an
+// empty one above it. Fitting it to the column is where an image the file sizes to the
+// column lands anyway. Fractional px throughout: whole ones cost a big frame 0.3mm.
+export function fitInlineImage(attrs: Record<string, unknown>, maxWidthPx: number): void {
+  const w = attrs.width;
+  if (typeof w !== 'number' || w <= maxWidthPx) return;
+  // Under a pixel over is our cm arithmetic disagreeing with the rendered column, not an
+  // oversized picture: trim the width so the line still holds it, and keep the height —
+  // LibreOffice lets that much overhang stand and draws the frame at its stated size.
+  if (typeof attrs.height === 'number' && w - maxWidthPx > 1) {
+    attrs.height = framePx(Math.max(1, (attrs.height * maxWidthPx) / w));
+  }
+  attrs.width = framePx(maxWidthPx);
+}
+
+// A frame size in doc px, from the cm or EMU the file states. Kept fractional — rounding
+// a page-wide picture to whole pixels loses 0.3mm of height — but our own export
+// quantizes to 0.001cm (0.04px), so a size that close to a whole pixel *is* one.
+export function framePx(px: number): number {
+  const whole = Math.round(px);
+  return Math.abs(px - whole) < 0.05 ? whole : Math.round(px * 100) / 100;
+}
+
+// A floating frame's margins from its wrapOffset: its left edge in the text column,
+// measured against the live column vars an indented anchor cannot skew (a right float
+// is placed from the far side). wrapOffsetY becomes a top margin — see the attr's note.
+export function frameMargins(wrap: WrapMode, offsetCm: unknown, boxWidthPx: number, offsetYCm?: unknown, distCm?: unknown): string {
+  const near = typeof offsetCm === 'number' ? `${Math.round(cmToPx(offsetCm))}px` : null;
+  // The gap beside the frame is the file's own (fo:margin-*, distL/distR) and nothing
+  // where it declares none — probed: LibreOffice wraps flush against a frame whose
+  // graphic style leaves the margin out. Above and below likewise.
+  const gap = typeof distCm === 'number' && distCm > 0 ? `${Math.round(cmToPx(distCm))}px` : '0';
+  if (wrap === 'topBottom') {
+    const top = typeof offsetYCm === 'number' && offsetYCm > 0 ? `${Math.round(cmToPx(offsetYCm))}px` : '0';
+    return `${top} 0 0 ${near ?? '0'}`;
+  }
+  if (wrap === 'left') return `0 ${gap} 0 ${near ?? '0'}`;
+  const far = near == null ? '0' : `calc(${COLUMN_WIDTH_CSS} - ${near} - ${boxWidthPx}px)`;
+  return `0 ${far} 0 ${gap}`;
+}
+
+// What picking a wrap mode by hand drops: the offsets belong to the mode that was set,
+// and so do the coordinate systems they were measured in (the page corner, a fixed
+// page). `inFront` means something for run-through alone. Shared with textBox.ts.
+export function droppedFrameAttrs(wrap: WrapMode, inFront: boolean): Record<string, unknown> {
+  return {
+    wrapOffset: null,
+    wrapOffsetY: null,
+    wrapFromPage: false,
+    anchorPage: null,
+    inFront: wrap === 'through' && inFront,
+  };
+}
+
+// Word's behind-text / in-front-of-text, ODF run-through: the text runs over or under
+// the frame, so it reserves nothing. Absolute with no offsets keeps the static position
+// it was anchored at; the file's own offsets ride as margins from there.
+export function applyRunThrough(el: HTMLElement, offsetCm: unknown, offsetYCm: unknown, inFront: boolean, fromPage = false): void {
+  const px = (cm: unknown) => (typeof cm === 'number' ? Math.round(cmToPx(cm)) : 0);
+  el.style.position = 'absolute';
+  el.style.margin = `${px(offsetYCm)}px 0 0 ${px(offsetCm)}px`;
+  el.style.zIndex = inFront ? '1' : '-1';
+  // A page-placed frame states its corner instead: placeFromPage turns the pair into
+  // the margins that reach it, and pagination re-places it from these same numbers.
+  if (fromPage) { el.dataset.pageX = String(px(offsetCm)); el.dataset.pageY = String(px(offsetYCm)); }
+  else { delete el.dataset.pageX; delete el.dataset.pageY; }
+}
+
+// Drag a frame that is out of the flow. Its offsets count from a point the drag cannot
+// move — the anchor's static position, the page's corner — so the pointer delta is
+// simply added to them. `done(null)` reports a click that never moved.
+export function startFreeMove(
+  event: MouseEvent,
+  dom: HTMLElement,
+  attrs: Record<string, unknown>,
+  preview: (by: { x: number; y: number } | null) => void,
+  done: (offsets: { wrapOffset: number; wrapOffsetY: number } | null) => void,
+): void {
+  event.preventDefault();
+  event.stopPropagation();
+  // The wrapper is axis-aligned, so its scaled/unscaled width ratio is the zoom.
+  const zoom = dom.getBoundingClientRect().width / dom.offsetWidth || 1;
+  const win = dom.ownerDocument.defaultView ?? window;
+  const cm = (px: number) => Math.round((px * 2.54 * 1000) / 96) / 1000;
+  const base = (v: unknown) => (typeof v === 'number' ? v : 0);
+  const sx = event.clientX;
+  const sy = event.clientY;
+  let by = { x: 0, y: 0 };
+  let moved = false;
+
+  const move = (e: MouseEvent): void => {
+    if (!e.buttons) { finish(); return; }
+    by = { x: cm((e.clientX - sx) / zoom), y: cm((e.clientY - sy) / zoom) };
+    moved = true;
+    preview(by);
+  };
+  const finish = (): void => {
+    win.removeEventListener('mousemove', move);
+    win.removeEventListener('mouseup', finish);
+    preview(null);
+    done(moved
+      ? { wrapOffset: base(attrs.wrapOffset) + by.x, wrapOffsetY: base(attrs.wrapOffsetY) + by.y }
+      : null);
+  };
+  win.addEventListener('mousemove', move);
+  win.addEventListener('mouseup', finish);
+}
+
+// Where an as-char frame sits against the line (ODF style:vertical-pos/-rel, probed
+// against LibreOffice): its bottom on the baseline by default, `text-*` against the
+// character area, `offset` its top wrapOffsetY cm below the baseline.
+export type InlineVAlign = 'middle' | 'below' | 'text-top' | 'text-middle' | 'text-bottom' | 'offset';
+
+export function inlineVerticalAlign(vAlign: unknown, boxHeightPx: number, offsetYCm: unknown): string {
+  if (!boxHeightPx) return '';
+  switch (vAlign) {
+    case 'middle': return `${-boxHeightPx / 2}px`;
+    case 'below': return `${-boxHeightPx}px`;
+    case 'text-top': return 'text-top';
+    case 'text-bottom': return 'text-bottom';
+    // No CSS keyword centres on the character area; 0.36em stands in for half of
+    // (ascent − descent), which Liberation Serif/Sans, Times and Arial all share.
+    case 'text-middle': return `calc(0.36em - ${boxHeightPx / 2}px)`;
+    case 'offset':
+      return typeof offsetYCm === 'number' ? `${-(cmToPx(offsetYCm) + boxHeightPx)}px` : '';
+    default: return '';
+  }
+}
+
+// The page text height in px, capping how tall an image can be stretched. Read live
+// from the :root vars the editor maintains (orientation/margins change them).
+export function pageContentHeightPx(): number {
+  const cs = getComputedStyle(document.documentElement);
+  const h =
+    parseFloat(cs.getPropertyValue('--user-page-height')) -
+    parseFloat(cs.getPropertyValue('--user-margin-top')) -
+    parseFloat(cs.getPropertyValue('--user-margin-bottom'));
+  return h > 0 ? h : 4000;
+}
+
+// setNodeMarkup replaces a leaf node outright, so the node selection maps off it and an
+// attribute change would deselect the node. Put it back where it stood. Shared with
+// textBox.ts and formula.ts; `marks` is the leaf's own, which the replacement drops.
+export function atomAttrTr(state: EditorState, pos: number, attrs: Record<string, unknown>, marks?: readonly Mark[]): Transaction {
+  const selected = state.selection instanceof NodeSelection && state.selection.from === pos;
+  const tr = state.tr.setNodeMarkup(pos, undefined, attrs, marks);
+  return selected ? tr.setSelection(NodeSelection.create(tr.doc, pos)) : tr;
+}
+
+export const Image = Node.create({
+  name: 'image',
+  group: 'inline',
+  inline: true,
+  atom: true,
+  draggable: true,
+  selectable: true,
+
+  addAttributes() {
+    return {
+      src: { default: null },
+      alt: { default: '' },
+      // px @96dpi and CW degrees; kept off the width/height attrs (rendered via
+      // inline style / data-rotation) so one place drives the node view.
+      width: {
+        default: null,
+        parseHTML: el => parsePx(el.getAttribute('width') ?? (el as HTMLElement).style.width),
+        renderHTML: () => ({}),
+      },
+      height: {
+        default: null,
+        parseHTML: el => parsePx(el.getAttribute('height') ?? (el as HTMLElement).style.height),
+        renderHTML: () => ({}),
+      },
+      rotation: {
+        default: 0,
+        parseHTML: el => parsePx((el as HTMLElement).getAttribute('data-rotation')) ?? 0,
+        renderHTML: () => ({}),
+      },
+      wrap: {
+        default: 'inline',
+        parseHTML: el => (el as HTMLElement).getAttribute('data-wrap') ?? 'inline',
+        renderHTML: () => ({}),
+      },
+      // Where a floating frame sits in the text column: cm from the column's left edge
+      // to the frame's left edge (Word's posOffset, ODF svg:x). null = flush to its side.
+      wrapOffset: {
+        default: null,
+        parseHTML: el => parseCm((el as HTMLElement).getAttribute('data-wrap-offset')),
+        renderHTML: () => ({}),
+      },
+      // How far below its anchor paragraph the frame sits, in cm (Word's positionV
+      // posOffset, ODF svg:y). Drawn as the float's top margin for `topBottom`, where no
+      // text sits beside the frame; a side float would push away lines Word keeps.
+      wrapOffsetY: {
+        default: null,
+        parseHTML: el => parseCm((el as HTMLElement).getAttribute('data-wrap-offset-y')),
+        renderHTML: () => ({}),
+      },
+      // The gap the file keeps between a floating frame and the text beside it, in cm
+      // (Word's distL/distR, ODF's fo:margin-left/-right). null = none, which is what
+      // both render for a frame that declares none.
+      wrapDist: {
+        default: null,
+        parseHTML: el => parseCm((el as HTMLElement).getAttribute('data-wrap-dist')),
+        renderHTML: () => ({}),
+      },
+      // The page a page-anchored frame is placed on (ODF text:anchor-page-number): a
+      // cover graphic or a watermark, out of the text flow. wrapOffset/-Y are then the
+      // frame's coordinates from that page's top-left corner, not from its column.
+      anchorPage: {
+        default: null,
+        parseHTML: el => parsePx((el as HTMLElement).getAttribute('data-anchor-page')),
+        renderHTML: () => ({}),
+      },
+      // Which end of its band a `topBottom` frame is set against (Word's positionH align,
+      // ODF's style:horizontal-pos). Set only where two frames share the band, so they
+      // sit side by side; a lone one fills the band, which is what the wrap means.
+      wrapAlign: {
+        default: null,
+        parseHTML: el => (el as HTMLElement).getAttribute('data-wrap-align') || null,
+        renderHTML: () => ({}),
+      },
+      // Where an as-char frame sits against the line (see inlineVerticalAlign).
+      // null = its bottom on the baseline, which is LibreOffice's and Word's default.
+      vAlign: {
+        default: null,
+        parseHTML: el => (el as HTMLElement).getAttribute('data-v-align') || null,
+        renderHTML: () => ({}),
+      },
+      // Whether wrapOffsetY counts from the top of the page the anchor lands on rather
+      // than from the anchor paragraph (Word's positionV relativeFrom="page", ODF's
+      // style:vertical-rel="page") — how a cover page's own blocks are placed.
+      wrapFromPage: {
+        default: false,
+        parseHTML: el => (el as HTMLElement).hasAttribute('data-wrap-from-page'),
+        renderHTML: () => ({}),
+      },
+      // A page-anchored frame's stacking against text (ODF style:run-through): default
+      // "background" sits behind; a title page's own cover graphic sets "foreground".
+      inFront: {
+        default: false,
+        parseHTML: el => (el as HTMLElement).hasAttribute('data-in-front'),
+        renderHTML: () => ({}),
+      },
+    };
+  },
+
+  parseHTML() {
+    return [{ tag: 'img[src]', getAttrs: el => {
+      const src = el.getAttribute('src') ?? '';
+      return /^(?:data:|idb:)/i.test(src) ? null : false;
+    } }];
+  },
+
+  renderHTML({ HTMLAttributes, node }) {
+    const w = node.attrs.width as number | null;
+    const h = node.attrs.height as number | null;
+    const rot = (node.attrs.rotation as number) || 0;
+    const wrap = (node.attrs.wrap as WrapMode) || 'inline';
+    const offset = node.attrs.wrapOffset as number | null;
+    const offsetY = node.attrs.wrapOffsetY as number | null;
+    const va = h ? inlineVerticalAlign(node.attrs.vAlign, h, offsetY) : '';
+    const style = [
+      w ? `width:${w}px` : '',
+      h ? `height:${h}px` : '',
+      rot ? `transform:rotate(${rot}deg)` : '',
+      va ? `vertical-align:${va}` : '',
+    ].filter(Boolean).join(';');
+    return ['img', mergeAttributes(HTMLAttributes, {
+      ...(style ? { style } : {}),
+      ...(rot ? { 'data-rotation': String(rot) } : {}),
+      ...(wrap !== 'inline' ? { 'data-wrap': wrap } : {}),
+      ...(offset != null ? { 'data-wrap-offset': String(offset) } : {}),
+      ...(offsetY != null ? { 'data-wrap-offset-y': String(offsetY) } : {}),
+      ...(node.attrs.wrapDist != null ? { 'data-wrap-dist': String(node.attrs.wrapDist) } : {}),
+      ...(node.attrs.wrapAlign ? { 'data-wrap-align': String(node.attrs.wrapAlign) } : {}),
+      ...(node.attrs.vAlign ? { 'data-v-align': String(node.attrs.vAlign) } : {}),
+      ...(node.attrs.anchorPage ? { 'data-anchor-page': String(node.attrs.anchorPage) } : {}),
+      ...(node.attrs.inFront ? { 'data-in-front': '' } : {}),
+      ...(node.attrs.wrapFromPage ? { 'data-wrap-from-page': '' } : {}),
+    })];
+  },
+
+  addCommands() {
+    return {
+      setImage:
+        attrs =>
+        ({ commands }) =>
+          commands.insertContent({ type: this.name, attrs }),
+
+      // Set the wrap mode on the selected image.
+      setImageWrap:
+        (wrap: WrapMode, inFront = false) =>
+        ({ state, dispatch }) => {
+          const sel = state.selection;
+          if (!(sel instanceof NodeSelection) || sel.node.type.name !== this.name) return false;
+          // Picking a side means "put it there", so the imported offset goes with it.
+          // A frame the file never floated has no distance either; give it the one a
+          // word processor's own wrap command writes (0.32cm).
+          const wrapDist = wrap === 'inline' ? sel.node.attrs.wrapDist : sel.node.attrs.wrapDist ?? 0.32;
+          if (dispatch) {
+            dispatch(atomAttrTr(state, sel.from,
+              { ...sel.node.attrs, wrap, wrapDist, ...droppedFrameAttrs(wrap, inFront) }));
+          }
+          return true;
+        },
+    };
+  },
+
+  addNodeView() {
+    return ({ node, editor, getPos, view }) => new ImageView(node as PMNode, editor, getPos as () => number, view);
+  },
+
+  // The drop cursor paints a caret where a dragged-in image *file* lands; moving an
+  // existing image uses the node view's live re-anchor drag, not PM's native node move.
+  addProseMirrorPlugins() {
+    return [dropCursor({ color: '#3b82f6', width: 2 }), imageLinePlugin(), behindTextPlugin()];
+  },
+});
+
+// A frame behind the text paints under the page and the paragraphs over it, so the
+// browser hit-tests those first and a click never reaches it — where both word
+// processors let one be picked. The event goes to the frame's own node view, which
+// selects and drags it as a click on any other frame does; text over it still wins,
+// as the caret does there.
+function behindTextPlugin(): Plugin {
+  return new Plugin({
+    props: {
+      handleDOMEvents: {
+        mousedown(view, event) {
+          const at = event.target;
+          // The primary button only: a right-click keeps whatever the browser's own
+          // context-menu handling does with the point.
+          if (!view.editable || event.button !== 0) return false;
+          if (at instanceof HTMLElement && at.closest('[data-wrap="through"]')) return false;
+          const frame = frameBehindPoint(view, event.clientX, event.clientY);
+          if (!frame) return false;
+          event.preventDefault();
+          (frame.querySelector('img') ?? frame).dispatchEvent(new MouseEvent('mousedown', {
+            clientX: event.clientX, clientY: event.clientY, button: 0, cancelable: true,
+          }));
+          return true;
+        },
+      },
+    },
+  });
+}
+
+// The topmost behind-text frame under the point, or null where text painted over it
+// covers the point — the elements above it are walked in paint order.
+function frameBehindPoint(view: EditorView, x: number, y: number): HTMLElement | null {
+  const doc = view.dom.ownerDocument;
+  for (const el of doc.elementsFromPoint(x, y)) {
+    if (!(el instanceof HTMLElement)) continue;
+    if (el.dataset.wrap === 'through' && view.dom.contains(el)) return el;
+    if (textUnder(el, x, y)) return null;
+  }
+  return null;
+}
+
+// Whether one of the element's own text runs covers the point: a hit on its box alone
+// is the empty part of a line or a paragraph, which the frame under it may take.
+function textUnder(el: HTMLElement, x: number, y: number): boolean {
+  const range = el.ownerDocument.createRange();
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType !== 3 || !node.nodeValue?.trim()) continue;
+    range.selectNodeContents(node);
+    for (const r of Array.from(range.getClientRects())) {
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return true;
+    }
+  }
+  return false;
+}
+
+// A line carrying nothing but an as-character image is as tall as the image or the
+// block's line height, whichever is more — no text descent hangs below it (probed
+// against LibreOffice). Whitespace beside the image adds none, which CSS cannot ask.
+const imageLineKey = new PluginKey('imageLine');
+
+// Hard breaks are the only line boundaries visible in the model, so a frame is taken
+// as alone on its line when nothing but whitespace shares its break-delimited run —
+// the image-plus-caption idiom. A soft wrap around it can't be seen from here.
+function imageLineDecorations(doc: PMNode): DecorationSet {
+  const decos: Decoration[] = [];
+  doc.descendants((node, pos) => {
+    if (!node.isTextblock) return true;
+    let images: number[] = [];
+    let text = false;
+    // 'true': a full-width float rides this block, so its successor clears the band;
+    // 'anchored': every such float is page-anchored — the successor must not clear.
+    let band: 'true' | 'anchored' | null = null;
+    const flush = () => {
+      if (!text) for (const at of images) decos.push(Decoration.node(at, at + 1, { class: 'image-line' }));
+      images = [];
+      text = false;
+    };
+    node.forEach((child, offset) => {
+      if (child.type.name === 'hardBreak') flush();
+      else if (child.type.name === 'image') {
+        const wrap = child.attrs.wrap ?? 'inline';
+        if (wrap === 'inline') images.push(pos + 1 + offset);
+        if (wrap === 'topBottom' && band !== 'true') band = child.attrs.anchorPage ? 'anchored' : 'true';
+      } else if (child.isText ? child.text?.trim() : true) text = true;
+    });
+    flush();
+    // The attribute editor.css keys the clearing on — an attribute, since a `:has()`
+    // there makes Chromium restyle the whole document on every insertion.
+    if (band) decos.push(Decoration.node(pos, pos + node.nodeSize, { 'data-wrap-band': band }));
+    return false;
+  });
+  return DecorationSet.create(doc, decos);
+}
+
+function imageLinePlugin(): Plugin {
+  return new Plugin({
+    key: imageLineKey,
+    state: {
+      init: (_, state) => imageLineDecorations(state.doc),
+      apply: (tr, old) => (tr.docChanged ? imageLineDecorations(tr.doc) : old),
+    },
+    props: { decorations(state) { return imageLineKey.getState(state); } },
+  });
+}
+
+// Node view: a bounding-box wrapper (reserves the rotated footprint for text flow)
+// holds a centered, rotated "rotor" with the <img>, eight resize handles (corners
+// aspect-locked, edges single-axis) and a rotate grip — all rotating with the image.
+class ImageView {
+  dom: HTMLElement;
+  private rotor: HTMLElement;
+  private img: HTMLImageElement;
+  private badge: HTMLElement;
+  private node: PMNode;
+  private editor: Editor;
+  // Handed in with the node: editor.view is not there yet while a saved document builds.
+  private view: EditorView;
+  private getPos: () => number;
+  // Live offsets while a free drag runs (cm), added to the node's own by offX/offY.
+  private dragBy: { x: number; y: number } | null = null;
+
+  constructor(node: PMNode, editor: Editor, getPos: () => number, view: EditorView) {
+    this.node = node;
+    this.editor = editor;
+    this.view = view;
+    this.getPos = getPos;
+
+    this.dom = document.createElement('span');
+    this.dom.className = 'image-node';
+
+    this.rotor = document.createElement('span');
+    this.rotor.className = 'image-rotor';
+
+    this.img = document.createElement('img');
+    this.img.src = (node.attrs.src as string) ?? '';
+    this.img.alt = (node.attrs.alt as string) ?? '';
+    // Pasted/HTML images may arrive without dimensions; adopt their natural size
+    // (capped to the text column) so every image is explicitly sized.
+    this.img.onload = () => this.adoptNaturalSize();
+    // Dragging an image live re-anchors it to the text position under the cursor so the
+    // surrounding text reflows in real time — inline and floating alike.
+    this.img.addEventListener('mousedown', e => this.startReposition(e as MouseEvent));
+    this.rotor.appendChild(this.img);
+
+    for (const cfg of HANDLES) {
+      const h = document.createElement('span');
+      h.className = `image-resize-handle image-resize-${cfg.k}`;
+      h.addEventListener('mousedown', e => this.startResize(e as MouseEvent, cfg));
+      this.rotor.appendChild(h);
+    }
+    const rot = document.createElement('span');
+    rot.className = 'image-rotate-handle';
+    rot.addEventListener('mousedown', e => this.startRotate(e as MouseEvent));
+    this.rotor.appendChild(rot);
+
+    this.dom.appendChild(this.rotor);
+
+    // Live "Width … × Height …" readout shown while resizing (on the axis-aligned
+    // wrapper so it stays upright even when the image is rotated).
+    this.badge = document.createElement('span');
+    this.badge.className = 'image-size-badge';
+    this.dom.appendChild(this.badge);
+
+    this.applyLayout(this.attrW(), this.attrH(), this.attrRot());
+    this.applyWrap();
+    // The frame is not in the document yet, so a sunk one has nothing to measure against.
+    requestAnimationFrame(() => this.sinkToOffset());
+  }
+
+  private showBadge(w: number, h: number): void {
+    const cm = (px: number) => ((px * 2.54) / 96).toFixed(2);
+    this.badge.textContent = `Width ${cm(w)} cm × Height ${cm(h)} cm`;
+    this.badge.style.display = 'block';
+  }
+
+  private attrW(): number | null { const w = this.node.attrs.width; return typeof w === 'number' ? w : null; }
+  private attrH(): number | null { const h = this.node.attrs.height; return typeof h === 'number' ? h : null; }
+  private attrRot(): number { return (this.node.attrs.rotation as number) || 0; }
+  private attrWrap(): WrapMode { const w = this.node.attrs.wrap; return w === 'left' || w === 'right' || w === 'topBottom' || w === 'through' ? w : 'inline'; }
+  // The wrapper's reserved (rotated) width, which applyLayout has just written.
+  private boxWidth(): number { return parseFloat(this.dom.style.width) || this.attrW() || 0; }
+  // The frame's offsets, carrying a running drag. Without one the attr passes through
+  // as it stands: null means "no offset stated", which places the frame flush.
+  private offX(): unknown { const v = this.node.attrs.wrapOffset; return this.dragBy ? (typeof v === 'number' ? v : 0) + this.dragBy.x : v; }
+  private offY(): unknown { const v = this.node.attrs.wrapOffsetY; return this.dragBy ? (typeof v === 'number' ? v : 0) + this.dragBy.y : v; }
+  // A frame out of the flow is placed by those offsets alone, so it is dragged by them.
+  private isFree(): boolean { return this.attrWrap() === 'through' || typeof this.node.attrs.anchorPage === 'number'; }
+
+  // Size the rotor to w×h, rotate it about its centre, and grow the axis-aligned
+  // wrapper to the rotated bounding box so the line reserves the right space.
+  private applyLayout(w: number | null, h: number | null, deg: number): void {
+    if (w && h) {
+      this.rotor.style.width = `${w}px`;
+      this.rotor.style.height = `${h}px`;
+      const rad = (deg * Math.PI) / 180;
+      const bw = Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad));
+      const bh = Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad));
+      this.dom.style.width = `${bw}px`;
+      this.dom.style.height = `${bh}px`;
+      this.dom.style.verticalAlign =
+        inlineVerticalAlign(this.node.attrs.vAlign, bh, this.node.attrs.wrapOffsetY);
+      // A frame alone on its line is the whole line, so where it sits against a baseline
+      // no longer means anything — except an offset, which still lengthens the line.
+      this.dom.dataset.vAlign = String(this.node.attrs.vAlign ?? '');
+    } else {
+      this.rotor.style.width = '';
+      this.rotor.style.height = '';
+      this.dom.style.width = '';
+      this.dom.style.height = '';
+      this.dom.style.verticalAlign = '';
+    }
+    this.rotor.style.transform = `translate(-50%, -50%) rotate(${deg}deg)`;
+  }
+
+  // Float the wrapper per wrap mode so text flows beside it at its anchor paragraph
+  // (left/right) or only above/below it (topBottom). The live re-anchor drag keeps it
+  // where the text is.
+  private applyWrap(): void {
+    const d = this.dom;
+    const wrap = this.attrWrap();
+    // Mirrors renderHTML's data-wrap, so one selector reaches a floating frame in the
+    // live view and in generated static HTML alike.
+    if (wrap === 'inline') delete d.dataset.wrap; else d.dataset.wrap = wrap;
+    d.style.float = '';
+    d.style.display = '';
+    d.style.clear = '';
+    d.style.margin = '';
+    d.style.position = '';
+    d.style.zIndex = '';
+    d.style.top = '';
+    d.style.left = '';
+    this.rotor.style.top = '';
+    const a = this.node.attrs;
+    if (typeof a.anchorPage === 'number' && a.anchorPage > 0) {
+      this.applyPageAnchor(a.anchorPage);
+      return;
+    }
+    delete d.dataset.anchorPage;
+    if (wrap === 'through') {
+      applyRunThrough(d, this.offX(), this.offY(), a.inFront === true, a.wrapFromPage === true);
+      // Deferred like sinkToOffset: the frame has to be laid out before its own page
+      // can be read off the grid.
+      if (a.wrapFromPage) requestAnimationFrame(() => placeFromPage(this.view, d));
+      return;
+    }
+    if (wrap === 'left' || wrap === 'right') {
+      d.style.float = wrap;
+      d.style.margin = frameMargins(wrap, a.wrapOffset, this.boxWidth(), null, a.wrapDist);
+    } else if (wrap === 'topBottom' && (a.wrapAlign === 'left' || a.wrapAlign === 'right')) {
+      // Sharing its band with the frame set against the other end (the importers only
+      // keep wrapAlign for such a pair): each floats to its own side, so both fit.
+      d.style.float = a.wrapAlign;
+      d.style.clear = a.wrapAlign;
+      d.style.margin = frameMargins(wrap, null, 0, a.wrapOffsetY);
+      this.sinkToOffset();
+    } else if (wrap === 'topBottom') {
+      // A full-width float (not display:block — which on an inline atom node view
+      // disrupts ProseMirror's view + page-break spacer widgets): text can only flow
+      // above/below it. applyLayout reset the width to the box; widen to the column here.
+      d.style.float = 'left';
+      d.style.clear = 'both';
+      d.style.width = '100%';
+      d.style.margin = frameMargins(wrap, null, 0, a.wrapOffsetY);
+      this.sinkToOffset();
+    }
+    // The wrapper spans the column, so the picture's own x is the rotor's place in it
+    // (the rotor is centred by CSS); every other mode positions the wrapper itself.
+    const x = wrap === 'topBottom' && !a.wrapAlign ? a.wrapOffset : null;
+    this.rotor.style.left = typeof x === 'number'
+      ? `${Math.round(cmToPx(x)) + (parseFloat(this.rotor.style.width) || 0) / 2}px` : '';
+  }
+
+  // Placed from its page's top-left corner, behind the text like the header layer's page
+  // background — unless the file's own run-through says otherwise (inFront). Its paragraph
+  // collapses to nothing (editor.css), so it takes no flow space either way. Both corners
+  // come from the grid: a section on its own paper makes the pages differ in height, and
+  // a page narrower than the sheet is centred in it rather than starting at its edge.
+  private applyPageAnchor(page: number): void {
+    const d = this.dom;
+    d.dataset.anchorPage = String(page);
+    const px = (cm: unknown) => Math.round(cmToPx(typeof cm === 'number' ? cm : 0));
+    d.style.position = 'absolute';
+    d.style.zIndex = this.node.attrs.inFront ? '1' : '-1';
+    const grid = readVerticalMargins(this.view.dom as HTMLElement).grid;
+    d.style.left = `${grid.leftOf(page) + px(this.offX())}px`;
+    d.style.top = `${grid.topOf(page) + px(this.offY())}px`;
+  }
+
+  // The offset counts from the anchor paragraph's top. Where text precedes the frame
+  // (the importers sink one behind the text — a full-width float pushes every following
+  // line under itself) the lines already cover part of it, so the rest is measured.
+  private sinkToOffset(): void {
+    const y = this.node.attrs.wrapOffsetY;
+    const p = this.dom.parentElement;
+    if (typeof y !== 'number' || y <= 0 || !p || !this.dom.previousSibling) return;
+    this.dom.style.marginTop = '0px';
+    const box = p.getBoundingClientRect();
+    const scale = box.width / p.offsetWidth || 1;
+    const above = (this.dom.getBoundingClientRect().top - box.top) / scale;
+    const gap = clamp(Math.round(cmToPx(y) - above), 6, pageContentHeightPx());
+    this.dom.style.marginTop = `${gap}px`;
+  }
+
+  // Drag an image to re-anchor it live to the text position under the cursor (text
+  // reflows in real time, throttled): a float re-anchors on a line change, an inline
+  // image to the exact character. One undo step (later moves are addToHistory:false).
+  private startReposition(event: MouseEvent): void {
+    if (!this.editor.isEditable) return;
+    if (this.isFree()) { this.startFreeDrag(event); return; }
+    event.preventDefault();
+    event.stopPropagation();
+    const view = this.view;
+    const origPos = this.getPos();
+    if (typeof origPos !== 'number') return;
+    const win = this.dom.ownerDocument.defaultView ?? window;
+
+    let curPos = origPos;
+    let firstMove = true;
+    let moved = false;
+    let raf = 0;
+    let lastX = event.clientX;
+    let lastY = event.clientY;
+
+    const lineTop = (pos: number): number | null => {
+      try { return view.coordsAtPos(pos).top; } catch { return null; }
+    };
+
+    // Re-anchor the image at the exact text position under the cursor (so it follows
+    // line by line, not paragraph by paragraph), but only when the cursor's line differs
+    // from the image's current line — a float won't move within a line, so skip churn.
+    const step = (): void => {
+      raf = 0;
+      const found = view.posAtCoords({ left: lastX, top: lastY });
+      if (!found) return;
+      const target = found.pos;
+      if (target === curPos || target === curPos + 1) return;
+      const $t = view.state.doc.resolve(target);
+      if (!$t.parent.isTextblock) return;
+      // A float can't move within a line — skip re-anchoring until the cursor's line
+      // changes; an inline image follows the cursor to the exact position.
+      if (this.attrWrap() !== 'inline') {
+        const curY = lineTop(curPos);
+        const tgtY = lineTop(target);
+        if (curY != null && tgtY != null && Math.abs(curY - tgtY) < 6) return;
+      }
+      const node = view.state.doc.nodeAt(curPos);
+      if (!node || node.type.name !== 'image') return;
+      try {
+        const tr = view.state.tr;
+        tr.delete(curPos, curPos + node.nodeSize);
+        const ip = tr.mapping.map(target);
+        tr.insert(ip, node);
+        tr.setSelection(NodeSelection.create(tr.doc, ip));
+        if (!firstMove) tr.setMeta('addToHistory', false);
+        view.dispatch(tr);
+        curPos = ip;
+        firstMove = false;
+        moved = true;
+      } catch { /* target can't hold an inline image — ignore */ }
+    };
+
+    const move = (e: MouseEvent): void => {
+      if (!e.buttons) { finish(); return; }
+      lastX = e.clientX;
+      lastY = e.clientY;
+      if (!raf) raf = win.requestAnimationFrame(step);
+    };
+    const finish = (): void => {
+      if (raf) win.cancelAnimationFrame(raf);
+      win.removeEventListener('mousemove', move);
+      win.removeEventListener('mouseup', finish);
+      // A plain click (no move) just selects the image so its toolbar/handles show.
+      if (!moved && typeof this.getPos() === 'number') {
+        const pos = this.getPos();
+        view.dispatch(view.state.tr.setSelection(NodeSelection.create(view.state.doc, pos)));
+      }
+    };
+    win.addEventListener('mousemove', move);
+    win.addEventListener('mouseup', finish);
+  }
+
+  // A frame out of the flow moves by its own offsets instead of re-anchoring: nothing
+  // wraps around it, so there is no text position to follow. A click that never moved
+  // selects it, as it does everywhere else.
+  private startFreeDrag(event: MouseEvent): void {
+    startFreeMove(event, this.dom, this.node.attrs, by => { this.dragBy = by; this.applyWrap(); }, offsets => {
+      if (offsets) { this.commit(offsets); return; }
+      const pos = this.getPos();
+      if (typeof pos === 'number') {
+        this.view.dispatch(this.view.state.tr.setSelection(NodeSelection.create(this.view.state.doc, pos)));
+      }
+    });
+  }
+
+  private adoptNaturalSize(): void {
+    if (this.attrW() != null && this.attrH() != null) return;
+    const nw = this.img.naturalWidth;
+    const nh = this.img.naturalHeight;
+    if (!nw || !nh) return;
+    const maxW = this.boxMaxWidth();
+    let w = nw;
+    let h = nh;
+    if (w > maxW) { h = Math.round((h * maxW) / w); w = maxW; }
+    this.commit({ width: Math.round(w), height: Math.round(h) });
+  }
+
+  // Largest width an image may take: the containing cell, else the page text column.
+  private boxMaxWidth(): number {
+    const box = (this.dom.closest('td,th') ?? this.dom.closest('.tiptap')) as HTMLElement | null;
+    if (!box) return 10000;
+    const cs = getComputedStyle(box);
+    const w = box.clientWidth - parseFloat(cs.paddingLeft || '0') - parseFloat(cs.paddingRight || '0');
+    return Math.max(MIN_SIZE_PX, w || 10000);
+  }
+
+  private commit(attrs: Record<string, unknown>): void {
+    const pos = this.getPos();
+    if (typeof pos !== 'number') return;
+    this.view.dispatch(atomAttrTr(this.editor.state, pos, { ...this.node.attrs, ...attrs }));
+  }
+
+  private startResize(event: MouseEvent, cfg: typeof HANDLES[number]): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!this.editor.isEditable) return;
+
+    const startW = this.rotor.offsetWidth;
+    const startH = this.rotor.offsetHeight;
+    if (!startW || !startH) return;
+    const aspect = startW / startH;
+    const deg = this.attrRot();
+    const th = (deg * Math.PI) / 180;
+    const cosT = Math.cos(th);
+    const sinT = Math.sin(th);
+    // The wrapper is axis-aligned, so its scaled/unscaled width ratio is the zoom.
+    const zoom = this.dom.getBoundingClientRect().width / this.dom.offsetWidth || 1;
+    const maxW = this.boxMaxWidth();
+    const maxH = pageContentHeightPx();
+    const sx = event.clientX;
+    const sy = event.clientY;
+    const win = this.dom.ownerDocument.defaultView ?? window;
+    let lastW = startW;
+    let lastH = startH;
+    let moved = false;
+
+    const move = (e: MouseEvent): void => {
+      if (!e.buttons) { finish(); return; }
+      // Un-rotate the screen delta onto the image's own axes so handles track the
+      // pointer at any rotation.
+      const dx = (e.clientX - sx) / zoom;
+      const dy = (e.clientY - sy) / zoom;
+      const lx = dx * cosT + dy * sinT;
+      const ly = -dx * sinT + dy * cosT;
+      if (cfg.aspect) {
+        let w = clamp(startW + cfg.x * lx, MIN_SIZE_PX, maxW);
+        let h = w / aspect;
+        if (h > maxH) { h = maxH; w = h * aspect; }
+        lastW = Math.round(w);
+        lastH = Math.round(h);
+      } else {
+        if (cfg.x) lastW = Math.round(clamp(startW + cfg.x * lx, MIN_SIZE_PX, maxW));
+        if (cfg.y) lastH = Math.round(clamp(startH + cfg.y * ly, MIN_SIZE_PX, maxH));
+      }
+      moved = true;
+      this.applyLayout(lastW, lastH, deg);
+      this.applyWrap();
+      this.showBadge(lastW, lastH);
+    };
+    const finish = (): void => {
+      win.removeEventListener('mousemove', move);
+      win.removeEventListener('mouseup', finish);
+      this.badge.style.display = 'none';
+      if (moved) this.commit({ width: lastW, height: lastH });
+    };
+    win.addEventListener('mousemove', move);
+    win.addEventListener('mouseup', finish);
+  }
+
+  private startRotate(event: MouseEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!this.editor.isEditable) return;
+
+    const w = this.rotor.offsetWidth;
+    const h = this.rotor.offsetHeight;
+    const rect = this.dom.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const win = this.dom.ownerDocument.defaultView ?? window;
+    let lastDeg = this.attrRot();
+    let moved = false;
+
+    const move = (e: MouseEvent): void => {
+      if (!e.buttons) { finish(); return; }
+      // Handle sits above centre, so 0° is straight up; Shift snaps to 15°.
+      let ang = (Math.atan2(e.clientY - cy, e.clientX - cx) * 180) / Math.PI + 90;
+      if (e.shiftKey) ang = Math.round(ang / 15) * 15;
+      lastDeg = ((Math.round(ang) % 360) + 360) % 360;
+      moved = true;
+      this.applyLayout(w, h, lastDeg);
+      this.applyWrap();
+    };
+    const finish = (): void => {
+      win.removeEventListener('mousemove', move);
+      win.removeEventListener('mouseup', finish);
+      if (moved) this.commit({ rotation: lastDeg });
+    };
+    win.addEventListener('mousemove', move);
+    win.addEventListener('mouseup', finish);
+  }
+
+  update(node: PMNode): boolean {
+    if (node.type !== this.node.type) return false;
+    // The picture is drawn from the attrs alone: an unchanged attrs object is the
+    // picture already on the page, and rewriting it costs a layout per picture.
+    const drawn = node.attrs === this.node.attrs;
+    this.node = node;
+    if (drawn) return true;
+    const src = (node.attrs.src as string) ?? '';
+    if (this.img.getAttribute('src') !== src) this.img.src = src;
+    this.img.alt = (node.attrs.alt as string) ?? '';
+    this.applyLayout(this.attrW(), this.attrH(), this.attrRot());
+    this.applyWrap();
+    return true;
+  }
+
+  selectNode(): void {
+    this.dom.classList.add('image-selected');
+  }
+
+  deselectNode(): void {
+    this.dom.classList.remove('image-selected');
+  }
+
+  ignoreMutation(): boolean {
+    return true;
+  }
+
+  // Keep ProseMirror out of all mouse handling on the image: startReposition owns the
+  // drag (live re-anchor) for inline and floating images alike, and the resize/rotate
+  // handles own theirs. Non-mouse events (keyboard, etc.) pass through to PM.
+  stopEvent(event: Event): boolean {
+    return event.type.startsWith('mouse');
+  }
+}

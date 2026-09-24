@@ -1,0 +1,153 @@
+# Frames: images and text boxes
+
+Covers `src/lib/editor/extensions/image.ts` and `textBox.ts` — node views, resize/rotate
+handles, wrap modes, frame offsets — and their ODF/DOCX legs.
+
+- **`image.ts`** (`Image`) — inline, as-character image atom (Word's "in line with text"). Attrs: `src` (data-URI), `alt`, `width`/`height` (**unscaled doc px @96dpi**, like `rowHeight`, and **fractional** — rounding a page-wide picture to whole px costs 0.3mm of height; `framePx` snaps back to a whole one within 0.05px, which is where our own export's 0.001cm quantization lands, so the round trip stays exact), `rotation` (CW degrees). The node view nests an `<img>` in a rotated "rotor" inside an axis-aligned wrapper that reserves the rotated bounding box (so text reflows around it). The rotor's transform makes it a stacking context, so a selected `.image-node` is given a `z-index` above the header/footer layer to keep handles that poke into a margin grabbable. It has eight zoom-aware resize handles — corners aspect-locked, edges single-axis (width- or height-only) — plus a rotation-arrow grip, and shows a live "Width … × Height …" (cm) badge while resizing; resize deltas are un-rotated onto the image's own axes so handles track the pointer at any angle (drag math mirrors `tableRowResize.ts`; width cap = the cell or page-text-column, height cap = the page text height). `setImage` command inserts it; the toolbar button (ToolbarExpanded), drag-drop and paste (Editor.svelte) read the file via `FileReader` → data-URI and clamp the initial size to the page text box. A picture that arrives by **URL** (an `<img>` pasted or dropped from a web page) is fetched into a data-URI right after the paste (`inlineRemoteImages`); one the site withholds is dropped with a message, since only a data-URI ever reaches a file. **Text wrap:** the `wrap` attr (`'inline'|'left'|'right'|'topBottom'|'through'`) makes the image a *floating* frame — `ImageToolbar.svelte` (a per-image floating toolbar wired in `Editor.svelte` like `TableToolbar`) sets the mode; `left`/`right` float the wrapper at its anchor paragraph (text flows on the open side via CSS `float`), `topBottom` is a **full-width `float`** (text only above/below), and `through` — Word's in-front-of / behind-text (`wp:wrapNone` + `behindDoc`), ODF's `style:wrap="run-through"` — leaves the flow entirely: `position: absolute` with no offsets keeps the static position it was anchored at, so it reserves neither width nor height, and `inFront` picks the side of the text it lands on. A frame the file places against the **page** takes both offsets from the page's corner instead (see `wrapFromPage`). Read as a side float instead it reserved a near-column-wide picture's whole height, which cost the image fixture a page and ~50 reports. A text box in that mode sits behind the text unless the file puts it in front (`inFront`, z-index 1 against its −2). Both frame toolbars and the ribbon's Arrange group offer the mode as the two entries Word's layout options have — behind the text and in front of it, one mode told apart by `inFront`. Picking **any** mode by hand drops the offsets and the frame of reference they were measured in (`droppedFrameAttrs`: `wrapFromPage`, `anchorPage`, `inFront`), or a page-placed frame set to a side wrap would export as page-relative with an offset that now counts from a paragraph. Every attribute change puts the node selection back (`atomAttrTr`): `setNodeMarkup` replaces a **leaf** node outright, so the selection maps off it and the frame would deselect itself — both its toolbars closing — on every wrap, resize or rotation commit. All modes use `float` deliberately: an in-flow `display:block` on an inline-atom node view splits the paragraph's inline content into anonymous block boxes, which desyncs ProseMirror's inline view descriptor and makes it drop the following page-break spacer widget; a float is out-of-flow and avoids that. Dragging an **inline** image runs ProseMirror's native node move (the `dropCursor` plugin shows the caret). Dragging a frame that is **out of the flow** (`through`, or page-anchored) moves it by its own offsets instead (`startFreeMove`, shared with `textBox.ts`): nothing wraps around it, so there is no text position to re-anchor to — and a page-placed frame is re-placed from its offsets on every pagination pass, so re-anchoring moved it nowhere at all. Those offsets count from a point the drag cannot move (the anchor's static position, the page's corner), so the pointer delta is simply added to them; the preview rides the node view's own `applyWrap`, and the commit is one undo step. Dragging a **floating** image runs a custom drag (`ImageView.startReposition`) that **live re-anchors** the node to the text position under the cursor, so the float and text reflow in real time as you drag; it's rAF-throttled and only moves when the cursor's line changes (a float can't move within a line), and stays a single undo step (first move records history, later moves are `addToHistory:false` and get rebased on undo). A paragraph that contains an image paginates **atomically** (`pageBreaks.ts` — pushed whole to the next page, spacer placed before it) so a page break never splits the paragraph next to the image's float (where ProseMirror drops the spacer widget). **Wrap distance:** `wrapDist` is the gap the file keeps beside a float, in cm (Word's `distL`/`distR`, ODF's `fo:margin-left`/`-right` on the graphic style) — only the side the text flows on, since the other one is the frame's own offset. A frame that declares none reserves **nothing**, beside it or above/below it: probed, LibreOffice wraps flush against it, and a gap of our own put every figure in a text box 3mm too tall and broke a line a word early. `setImageWrap` gives a frame the file never floated the 0.32cm a word processor's own wrap command writes. **Vertical alignment (as-char):** `vAlign` carries ODF's `style:vertical-pos`/`-rel` pair for an inline frame — `null` (LibreOffice's `top`/`baseline` and Word's only mode) stands the frame on the text baseline, `middle`/`below` centre it on the baseline or hang it below, and `text-top`/`text-middle`/`text-bottom` measure against the character area instead (CSS `vertical-align: text-top`/`text-bottom`; nothing in CSS centres on that area, so `text-middle` uses 0.36em for half of ascent − descent, which Liberation Serif/Sans, Times and Arial share). `from-top` becomes `vAlign: 'offset'` and puts the frame's top `wrapOffsetY` cm below the baseline whatever the relation says — all probed against LibreOffice, whose formula images use `middle`/`text` and `from-top` almost exclusively. A line an as-char frame has to itself — nothing beside it but whitespace — is as tall as the frame or the block's line height, whichever is more, with **no text descent below it** (probed); `image.ts` gives such a frame an `image-line` class, since CSS cannot ask whether a line holds real text. Hard breaks are the only line boundaries the model shows, so the run between two of them is what gets tested — which covers the frame-break-caption idiom LibreOffice's own guides are full of; a frame alone on a *soft-wrapped* line is invisible from there. A frame that shares its line with text keeps the baseline and the descent. **Frame offsets:** `wrapOffset` is the frame's left edge in the text column (Word's `positionH` posOffset, ODF `svg:x`), rendered as the float's near/far margin against the live column vars — an indented anchor paragraph can't skew it — and shared with `textBox.ts` through `frameMargins`. A `topBottom` float spans the column, so its own x moves the *rotor* inside the wrapper instead. `wrapFromPage` says that the frame is placed against the **page** the anchor lands on (Word's `positionV relativeFrom="page"`, ODF's `style:vertical-rel="page"` — how a cover page's blocks are placed): `placeFromPage` (`pageBreaks.ts`, deferred a frame so the frame is laid out first) reads that page off the page grid and measures the frame's static position, turning both offsets into the margins that reach the page's corner — `wrapOffsetY` below the page top, `wrapOffset` from the text column, which is where Word measures a `positionH` from and not where the anchor character happens to sit. Every pagination pass re-places them, since the spacers it inserts move the anchor under them. The frame stays anchored in the flow it belongs to and no page number is stored. `wrapOffsetY` (`positionV`, `svg:y`) is otherwise the frame's top below the anchor paragraph's, drawn for `topBottom` only — no text sits beside such a frame, where a side float's top margin would push away lines Word keeps. Chromium places **every** line after a full-width float below it, even the ones the float's top margin leaves room for, so a frame set below the paragraph top is sunk behind that paragraph's text at import (`sinkOffsetFrames`, both importers) and `ImageView.sinkToOffset` measures what the lines above it already cover, adding only the rest. The **block after the anchor paragraph clears the band** (`imageLinePlugin` marks the block with `data-wrap-band`, an `editor.css` sibling rule clears the next one): a float only pushes lines that intersect it, so a short block (a heading) would slot into the clearance gap a prior side float opens above the band — both word processors start it below; a page-break spacer and the block holding a band-sharing partner frame are exempt. The marker is an attribute, not a `:has()` in the selector: with `:has()` left of `+`, Chromium restyled every element under `.tiptap` on each insertion there — a spacer, a split paragraph — 150 ms at 124 pages, twice per keystroke that moved a page break. Two `topBottom` frames set against **opposite ends** of nearby paragraphs (`wrapAlign`, from Word's `positionH` align / ODF `style:horizontal-pos`) share one band and float to their own sides instead: `pairAlignedFrames` (import/odt.ts, both importers) keeps the attr only for such a pair — a lone one reserves the whole band, which is what the wrap means — and scales a pair up to 15% wider than the column down to it, since Word lets the two overlap in the middle and two floats cannot. A frame Word puts *inside* running text still lands after it: browsers can't wrap text around a freely-positioned box (CSS Exclusions are unimplemented). Inline images stay as-char. Works inside table cells. Not available while editing a header/footer (the HF schema has no image node). Images live as data-URIs in the autosaved JSON; `autosave.ts` warns once if that exceeds the localStorage quota.
+- **`textBox.ts`** (`TextBox`) — an **inline** text box / basic shape carrying editable block content (`group: 'inline'`, `inline: true`, `content: '(paragraph|heading|bulletList|orderedList)+ | table'`, `isolating`) — the frame both formats write, a character in a run that holds paragraphs. It rides a paragraph, so `inline` really is in the line, and a box reaches a table cell or a list item through their paragraphs, as one does in Word. Attrs: `width`/`height` (px @96dpi; height renders as **min-height** — content grows the box), `rotation` (CW deg), `wrap` (image's `WrapMode`), `shapeKind` (see the shape table below), `fillColor`/`strokeColor` (`null` = transparent/no border), `strokeWidthPt`. Padding is the fixed `TEXTBOX_PADDING_CM` (0.15cm). **Wrap** follows `ImageView.applyWrap` exactly: `inline` is an `inline-block` in the line, `left`/`right` are floats, `topBottom` a **full-width float** whose wrapper spans the column while `placeInBand` moves the rotor across it, `through` leaves the flow. Never `display:block` — that splits the paragraph's inline content into anonymous block boxes and ProseMirror drops the following page-break spacer. A paragraph holding a box paginates **atomically** (`pageBreaks.ts`), whichever way the box wraps. `TextBoxView` mirrors `ImageView` (wrapper reserving the rotated bbox → rotor carrying fill/stroke/rotation → `contentDOM`); the rotor is out of flow and auto-grows, so a ResizeObserver refits the wrapper. **Click model (Word-like):** `stopEvent`/`isFrameHit` claim mouse events on a ~6px frame ring (rotation-/zoom-aware) → NodeSelection + handles (the shared `image-*` handle classes/CSS); clicks further inside pass to ProseMirror (caret). The box is browser-`draggable` only while node-selected, so PM's native drag moves it without hijacking text selection — except out of the flow, where the ring drag runs `startFreeMove` (PM's node move would re-anchor it). **Reaching the position beside the box:** a frame nobody is editing is an atom to the browser — a `contenteditable="false"` node decoration, dropped while the caret is in its text — and `ArrowLeft`/`ArrowRight` at the box's first/last text position step out to `before`/`after` the node. Without both, a box that starts its paragraph is a trap: there is no text position beside it, so the browser pulls the caret meant for the box's own place in the line into the frame and everything typed there lands inside it. The frame then has to place the caret itself on the click that enters it (`onFrameMouseDown`, `stopEvent`), since a non-editable one gets none from the browser. A nested `contentEditable` island is not the way — ProseMirror's `hasFocus` is `activeElement == view.dom`, and an island holding focus makes it read no selection at all. Commands: `insertTextBox()` (at the caret, cursor inside; refused inside a box), `setTextBoxAttrs()` (NodeSelection *or* cursor inside; helper `findTextBox`), `setTextBoxAlign()`. **Two guards** the schema cannot express live in the extension's plugin: a `filterTransaction` refuses a box inside a box — both word processors refuse it and neither format's writer has a place for one — and an `appendTransaction` grows a selection ending inside a box it did not start in out to the box's own bounds, since deleting such a range dissolves the frame and spills its text into the body. `TextBoxToolbar.svelte` (wired in `Editor.svelte` like the image toolbar, also shown while the caret is inside a box) sets wrap/shape/fill/stroke, the alignment and `textVertical` — the box's text running **top-to-bottom, right-to-left** (`writing-mode: vertical-rl` on the content area, which is all the browser needs). It round-trips as the style's own writing mode in ODF — a plain box is a Writer text frame (its `TbxFr` style chains to `Frame`; see `src/lib/export/CLAUDE.md`) and takes it in the graphic properties, a drawing *shape* only in its style's paragraph properties (both probed) — and Word's `w:bodyPr vert`; ODF's bottom-to-top and Word's `vert270` read as the same one direction the browser lays out. **Vertical anchor:** `textVAlign` (`top`/`middle`/`bottom`) is where the text sits in a box taller than it is — ODF's `draw:textarea-vertical-align`, Word's `wps:bodyPr anchor` (its two spread modes read as bottom; nothing in CSS spreads lines). The node view flexes the rotor, whose handles are positioned absolutely and stay out of that flow. Set in the ribbon's Shape Format tab, beside the vertical-text button; not on the frame toolbar, which is the compact subset. The name is not `vAlign` — that attr is a *frame's* own place on the line (above), and the as-char import path writes it on a box too. **DOCX autofit:** the shape body writes `<a:noAutofit/>`, which is what LibreOffice writes for the same frame — read as `spAutoFit` it gives the frame `fo:min-height="0"` and draws its text detached from the shape, over whatever follows (probed). The cost is the ODF leg's auto-grow: content taller than the declared height is clipped there, DOCX having no `fo:min-height`. **LibreOffice puts a `wrapTopAndBottom` anchor's band above its anchor paragraph** whatever the anchor says — probed against `posOffset` 0/635, `align top`, `relativeFrom` line/column, `allowOverlap`, and against a file LibreOffice exported itself; `wp:inline` is the one form it places right, and a band-wrapped box keeps `wp:anchor` anyway (Word is the reference for `.docx`). **Where it sits across the column:** only a **band-wrapped** box has a place of its own — `wrapAlign` (`null`/`center`/`right`, drawn by `placeInBand`), and the toolbar's three buttons show for that mode alone, dropping any `wrapOffset` when one is picked. A side wrap names the side itself; a box **in the line** is a character its paragraph places, exactly as a picture is, so the ordinary paragraph alignment does it and a second control on the frame toolbar would only be the same thing under a frame icon. That ordinary command needs one correction, though (`TextAlignInFrames`): a **selected** box is one node whose range covers its own paragraphs, so it would align the box's contents along with the block holding it — with the frame selected only that block is meant (`setTextBoxAlign`), while the caret inside the box still aligns that text. An as-char frame must name the **baseline pair** explicitly in ODF (`style:vertical-pos="top" style:vertical-rel="baseline"`): the `Frame` parent hangs a frame that names none below the line, where a style-less as-char frame (an image) stands on it — probed, and the measured difference between the two formats until it was written.
+
+## A floating table
+
+A table Word takes out of the flow (`w:tblpPr` — every cover-page layout has one) is a
+**frame holding nothing but that table**, which is how LibreOffice keeps one too: the
+blocks after it then start where the table does instead of below it, and text wraps
+beside it. The box's content expression is an alternation for exactly that reason — a
+table in a box is the whole content or nothing, since neither format's writer has a
+place for one standing beside text in a frame. Both exporters write it back as the
+file's own floating table (`w:tblpPr` via the package's `float`, ODF's
+`draw:frame`/`draw:text-box` around the table), not as a shape.
+
+## A box in static HTML
+
+A box is inline and its content is blocks, and no `<p>` can hold those: the browser's
+parser breaks the paragraph open around it. That only bites where the document goes
+through an **HTML string** — `generateHTML`, `editor.getHTML()`. Copy and paste inside
+the editor is unaffected (ProseMirror pastes its own cached slice), and the raster PDF
+path reads the live DOM. The **vector print path** (`export/pdf.ts`) handles it:
+`hoistTextBoxes` gives each box a paragraph of its own before serializing, and
+`buildBodyHtml` drops the two empty paragraphs the split then leaves around it — so the
+box prints as a block between whole paragraphs, which is how it printed as one.
+The **clipboard** handles it the other way: `boxClipboardSerializer` (a
+`clipboardSerializer` prop) writes each box as an inline `<span data-tbx>` carrying its
+blocks as JSON, and the `span[data-tbx]` parse rule's `getContent` reads them back — so a
+paste into another window keeps the box where it stood in the line, while a program that
+cannot read the attribute still gets the span's plain text. An **AutoText** entry stores
+the slice's nodes for the same reason (`storage/autoText.ts`).
+Pasted foreign HTML goes the other way round: ProseMirror fits pasted blocks into the
+caret's line by wrapping each one that doesn't fit in the only inline node that holds
+blocks — a box — so `unwrapPastedBoxes` (`editor/paste.ts`, called from `transformPasted`,
+whose direct prop wins over every plugin's) spills a **size-less** box's blocks back where
+the paste went. Every real box carries a size, from the insert command or either importer.
+Left in, a paste into a box was dropped whole: a box inside a box never enters the
+document.
+
+## What a frame costs a big document
+
+Every frame is refitted by **one** `ResizeObserver` for the whole document, and a round's
+reads run before its writes: a per-view observer is delivered in a callback of its own, so
+the wrapper written for one frame makes the browser lay the document out again before the
+next one's `offsetWidth` is read — 1.4 s of forced layout on a document holding 450 frames,
+and the ProseMirror DOM observer flushes (each reading the selection, each another layout)
+once per callback on top. The size is read from the rotor, not taken from the observation:
+`offsetWidth` snaps to the pixel grid the frame sits on, and the fractional border box moves
+blocks below it by a pixel. Both node views also leave the DOM alone when `update()` brings
+the same `attrs` object — everything they write is drawn from the attrs, and text typed
+inside a box keeps them, so there is nothing to redraw.
+
+## Clicking a float
+
+A block after a float keeps its own box **over** the float — only its line boxes move out
+of the way — so the block on top takes every click meant for the frame, and the frame
+stops selecting once anything follows it (a caption is the usual first such block).
+`editor.css` lifts a floating frame (`.image-node[data-wrap]`) above the in-flow boxes;
+nothing is hidden, since text flows beside a frame and never across it. A page-anchored
+frame is excluded — it carries its own place in the stack (`inFront`).
+
+A frame **behind** the text cannot be lifted at all — it has to paint under the text —
+so the browser hit-tests the page and every paragraph over it first and a cover picture
+took no click whatever. `behindTextPlugin` (`image.ts`) walks `elementsFromPoint` for the
+topmost such frame and hands the mousedown to its own node view, which selects and drags
+it as a click on any other frame does; a text run painted over the point stops the walk,
+so text keeps the caret, as it does in both products.
+
+## Stacking behind the text
+
+Among frames behind the text a **picture paints over a shape** — probed against
+LibreOffice, which puts a cover photo over the blocks a template layers under it whatever
+stacking order the file names. So the box's node view sets `z-index: -2` and a picture
+keeps -1, with the page sheets moving to -3 (`PageSheetLayer`).
+
+## Shapes (`utils/shapes.ts`)
+
+Every kind past the three CSS can draw is **one polygon in a 0…100 box**, given once and
+used three ways: the node view draws it as an SVG `path` (`preserveAspectRatio="none"` to
+stretch it to the frame, `vector-effect="non-scaling-stroke"` so the line stays even under
+that distortion), the ODF export scales the same points into the 21600 viewBox of
+`draw:enhanced-path`, and Word gets the preset's `prst` name and draws its own geometry.
+Adding a shape is one entry in `SHAPES` — no icon, no export branch, no importer case.
+
+- The three rectangular kinds keep the geometry **LibreOffice itself writes** (the
+  round-rectangle path pre-evaluated for modifier 3600); a polygon derives its own.
+- A ring (pentagon, star) is stretched onto the whole box per axis (`fit`): an
+  odd-cornered shape leaves gaps at its bounds, and the presets both word processors draw
+  fill their frame.
+- `textArea` is where text goes inside the outline. It travels as ODF `draw:text-areas`
+  and pads `.textbox-content` in the editor — where a polygon's frame carries **no**
+  padding of its own, so the outline covers its whole box and the ring moves to the text.
+  LibreOffice ignores the text area of a preset it recognizes and sets the text at the
+  frame's top left instead, as it already does for our ellipse.
+- An importer maps the file's `draw:type`/`prst` back through the same table;
+  `shapeFromOdfType`/`shapeFromPrst` return **null** for a preset we can't draw, which is
+  what makes the warning possible instead of flattening it to a rectangle.
+
+## Lines and arrows
+
+`line`, `lineArrow` and `lineDoubleArrow` are **two endpoints, not a box**: they hold no
+text (the paragraph the schema requires is hidden and never exported), take no fill, and
+run across the frame's diagonal — `flipV` picking which one, the single flag Word's
+`flipV` and ODF's own endpoint order both come down to. They are drawn in the frame's
+**real pixels** (`linePaths`), not the stretched 0…100 box a polygon uses: an arrow head
+has to keep its shape however flat the frame is, and the head scales with the pen
+(`arrowHeadPx`, floored so a hairline still shows one).
+
+The three share their `odf`/`prst` names, because **the heads are what tell them apart**:
+both importers read the heads a file declares and `lineKindFor` names the kind, so a
+`straightConnector1` with no heads is a plain line and a `line` preset with both is a
+double arrow.
+
+- **ODF** gives a line its own element — `<draw:line svg:x1/y1/x2/y2>`, no width or
+  height — and its heads are a **named marker**, so `applyTextBoxes` also writes the one
+  `<draw:marker draw:name="Arrow">` definition into `styles.xml`, LibreOffice's own name
+  and path. It goes in only when a line asks for it, and needs `ensureDrawNamespaces`:
+  an undeclared `draw:` prefix there makes the whole file unreadable.
+- **DOCX** keeps the frame and flips it (`<a:xfrm flipV="1">`), the heads riding the
+  shape's `<a:ln>` as `a:headEnd`/`a:tailEnd`, and writes no `wps:txbx` at all.
+- An anchored frame's DOCX `positionV` posOffset is floored at one twip: on exactly 0,
+  LibreOffice's wrap layout paints a neighbouring inline box's text outside its shape
+  (probed; LO never writes less itself). The importer reads the twip back as no offset.
+- A line is a frame of **no height**, and a zero-high SVG viewport turns rendering off
+  altogether (per spec), so `applyLine` gives it at least the stroke and lets the line
+  overflow it by half, as it does in any flat frame.
+## Freeform outlines (`shapePath`)
+
+A drawing this editor offers no tool to author — a polygon, a polyline, a bezier curve,
+a connector's elbow — still has to survive being opened and saved. The box keeps the
+file's own outline in `shapePath`, an SVG `d` in the same **0…100 box** a preset's
+points live in (`utils/shapes.ts`), and its presence is what makes the box draw itself.
+An outline that never closes is **stroked only**, whatever fill its style declares,
+which is how both products draw a polyline.
+
+- **Reading** takes four path dialects, all through `parseSvgPath`, which resolves the
+  relative commands both products write into absolute `M`/`L`/`C`/`Z`: ODF's
+  `draw:points` (polygon closed, polyline open), its `svg:d` (`draw:path`, and a
+  `draw:connector`, which carries the resolved elbow beside its endpoints), a
+  `non-primitive` `draw:enhanced-path`, DrawingML's `a:custGeom` path list, and VML's
+  `path` — whose cases are SVG's the other way round (`parseVmlPath`).
+- A geometry whose commands are **modifier formulas** (`?f0`) or an arc is not an
+  outline we can draw, so the shape stays unsupported and is dropped with the warning,
+  as before. So is a Word connector preset (`bentConnector3`), which is a geometry
+  Word resolves and does not write down.
+- **Writing** goes back out as the shape's own geometry: ODF a `non-primitive`
+  `<draw:enhanced-geometry>` in its 21600 viewBox (probed: LibreOffice writes that
+  straight back out unchanged), DOCX an `<a:custGeom>` path list in the shape's EMU
+  extent. Both render in LibreOffice exactly as the editor draws them.

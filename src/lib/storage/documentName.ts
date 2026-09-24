@@ -1,0 +1,66 @@
+import { docKey } from './docScope';
+
+// The user-visible document name (without the .odt extension). Drives the
+// suggested filename on save; empty falls back to the heading-derived name.
+
+const KEY = docKey('edentext-doc-name');
+
+export function loadDocName(): string {
+  return localStorage.getItem(KEY) ?? '';
+}
+
+export function saveDocName(name: string): void {
+  localStorage.setItem(KEY, name);
+}
+
+// Drop a trailing .odt or .ott (case-insensitive) so the field shows just the name.
+export function stripOdtExtension(name: string): string {
+  return name.replace(/\.o[dt]t$/i, '');
+}
+
+// The save filename from the first heading that has text (sanitized, 50 chars at
+// most); `document.odt` without one.
+export function deriveFilename(json: { content?: { type?: string; content?: { text?: string }[] }[] }): string {
+  const heading = json.content?.find((n) => n.type === 'heading' && n.content?.length);
+  return filenameFor(heading?.content?.[0]?.text);
+}
+
+export function filenameFor(firstText: string | undefined): string {
+  const name = firstText?.slice(0, 50).replace(/[^a-zA-Z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+  return name ? `${name}.odt` : 'document.odt';
+}
+
+// Strip filesystem-illegal characters; keep spaces so user-typed titles read
+// naturally (unlike the heading slug, which hyphenates).
+export function sanitizeNameForFile(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').trim();
+}
+
+export type DocumentFormat = 'odt' | 'docx';
+
+// The format the open document round-trips in. Absent at the .odt default, so only a
+// document that came in as .docx writes anything.
+const FORMAT_KEY = docKey('edentext-doc-format');
+
+export function loadDocFormat(): DocumentFormat {
+  return localStorage.getItem(FORMAT_KEY) === 'docx' ? 'docx' : 'odt';
+}
+
+export function saveDocFormat(format: DocumentFormat): void {
+  if (format === 'docx') localStorage.setItem(FORMAT_KEY, format);
+  else localStorage.removeItem(FORMAT_KEY);
+}
+
+// Whether the open document is password-protected. The password itself is never
+// stored, so after a reload this is what makes the first save ask for it again.
+const PROTECTED_KEY = docKey('edentext-doc-protected');
+
+export function loadDocProtected(): boolean {
+  return localStorage.getItem(PROTECTED_KEY) === '1';
+}
+
+export function saveDocProtected(on: boolean): void {
+  if (on) localStorage.setItem(PROTECTED_KEY, '1');
+  else localStorage.removeItem(PROTECTED_KEY);
+}
